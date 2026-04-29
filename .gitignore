@@ -1,0 +1,127 @@
+# Secrets and env
+secrets/
+.env
+*.env
+
+# Python env/cache
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Logs
+logs/
+*.log
+debug.log
+
+# Generic cache/build
+cache/
+caches/
+.cache/
+build/
+dist/
+git-meta/
+
+# IDE
+.idea/
+.vscode/
+
+# Omega private/runtime/media
+Media/
+media/
+Movies/
+Shows/
+TV/
+Downloads/
+library.json
+sources.txt
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.wmv
+*.m4v
+*.mp3
+*.flac
+*.wav
+*.srt
+*.ass
+*.vtt
+.omega_cache/
+**/.omega_cache/
+thumbnails/
+**/thumbnails/
+metadata_cache.json
+*_cache.json
+
+# Local databases/runtime state
+*.db
+*.sqlite
+*.sqlite3
+
+# Omega private/runtime/media exclusions
+Media/
+media/
+Movies/
+movies/
+Shows/
+shows/
+Videos/
+videos/
+Downloads/
+downloads/
+.omega_cache/
+**/.omega_cache/
+thumbnails/
+**/thumbnails/
+library.json
+sources.txt
+metadata_cache.json
+*_cache.json
+
+# Media files
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.wmv
+*.m4v
+*.webm
+*.mp3
+*.flac
+*.wav
+*.m4a
+*.srt
+*.ass
+*.vtt
+
+# Local/private/dev artifacts
+secrets/
+.env
+*.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+logs/
+*.log
+debug.log
+cache/
+caches/
+.cache/
+build/
+dist/
+git-meta/
+.idea/
+.vscode/
+*.db
+*.sqlite
+*.sqlite3
+
+# Local/broken controller backup snapshots excluded from Git
+player/controller_broken_snapshot.py
+*_broken_snapshot.py
