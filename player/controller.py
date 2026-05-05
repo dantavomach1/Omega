@@ -23,7 +23,7 @@ from collections import defaultdict, deque
 from difflib import SequenceMatcher
 
 from PySide6.QtCore import QObject, Qt, QRect, QRectF, QTimer, QEvent, QPoint, QUrl, QSize, QByteArray, Signal, QEasingCurve, QPropertyAnimation
-from PySide6.QtGui import QFont, QCursor, QWheelEvent, QAction, QColor, QPixmap, QPainter, QPainterPath, QPen, QLinearGradient, QRegion, QFontMetrics, QKeySequence, QShortcut
+from PySide6.QtGui import QFont, QCursor, QWheelEvent, QAction, QColor, QPixmap, QPainter, QPainterPath, QPen, QLinearGradient, QRegion, QFontMetrics, QKeySequence, QShortcut, QFontDatabase
 from PySide6.QtWidgets import (
     QMainWindow,
     QApplication,
@@ -168,6 +168,8 @@ from omega.app.text_naming import (
 from omega.library.tmdb_client import TMDBClient, TMDBHit
 from omega.library.metadata_cache import MetadataCache, MetadataProvider
 from omega.library.home_catalog import CatalogBuildCancelled, HomeCatalogService
+from omega.library.media_discovery import MediaDiscoveryService
+from omega.library.metadata_provider_base import DisabledMetadataProvider
 from omega.player.mpv_backend import MPVBackend
 from omega.player.skip_segments import SegmentSkipStore, SkipSegment, TUNING as SEGMENT_SKIP_TUNING
 from omega.player.video_surface import FloatingMiniPlayer, JumpSlider
@@ -198,7 +200,7 @@ from omega.ui.layout_engine import (
     rects_overlap,
     validate_layout,
 )
-from omega.ui.theme_catalog import OMEGA_THEME_PRESETS, THEME_CATEGORIES
+from omega.ui.theme_catalog import OMEGA_CURATED_THEME_NAMES, OMEGA_THEME_PRESETS, THEME_CATEGORIES
 from omega.player.home_runtime import HomeRuntimeCoordinator
 from omega.player.player_chrome import (
     CONTROLS_BAR_HEIGHT,
@@ -455,6 +457,10 @@ class HomeLayoutTuning:
     home_row_render_prefetch_min_px: int = 240
     home_scroll_schedule_debounce_ms: int = 60
     row_item_cap: int = 10
+    first_paint_min_viewport_w_px: int = 720
+    first_paint_min_viewport_h_px: int = 420
+    startup_cover_fade_ms: int = 170
+    startup_status_text: str = "Preparing Home"
 
     # ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ Floating chevron overlay (sandbox-proven params) ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬
     # These control the circular arrow buttons that float over rails
@@ -624,6 +630,19 @@ class ShellNavTuning:
     rail_brand_meta_font_px: int = 10
 
 @dataclass(frozen=True)
+class TypographyTuning:
+    preferred_family: str = "Segoe UI"
+    fallback_family: str = "Inter"
+    base_point_size: int = 10
+    section_title_point_size: int = 12
+    page_title_point_size: int = 15
+    rail_title_point_size: int = 12
+    rail_meta_point_size: int = 10
+    card_title_point_size: int = 10
+    card_meta_point_size: int = 9
+    button_point_size: int = 10
+
+@dataclass(frozen=True)
 class OmegaTuning:
     home:     HomeLayoutTuning    = HomeLayoutTuning()
     viewport: ViewportInsetTuning = ViewportInsetTuning()
@@ -631,6 +650,7 @@ class OmegaTuning:
     inline:   InlineExpanderTuning = InlineExpanderTuning()
     player:   PlayerTuning         = PlayerTuning()
     shell:    ShellNavTuning       = ShellNavTuning()
+    typography: TypographyTuning   = TypographyTuning()
 
 
 # ============================================================
@@ -1215,6 +1235,9 @@ class PlayerController(QObject):
         self._home_browse_cache_key: Optional[Tuple[int, int, str]] = None
         self._home_browse_cache: Optional[Dict[str, Any]] = None
         self._home_pending_hidden_build = False
+        self._home_startup_cover_active = True
+        self._home_startup_cover_ready = False
+        self._home_startup_cover_reason = "startup"
         self._home_last_render_signature: Optional[Tuple[Any, ...]] = None
         self._home_build_request_pending = False
         self._home_build_requested_profile: Optional[dict] = None
@@ -1555,6 +1578,8 @@ class PlayerController(QObject):
         self._player_playlist_signature = ""
         self._player_skip_intro_btn: Optional[QPushButton] = None
         self._player_skip_outro_btn: Optional[QPushButton] = None
+        self._player_prev_chapter_btn: Optional[QPushButton] = None
+        self._player_next_chapter_btn: Optional[QPushButton] = None
         self._player_skip_intro_segment: Optional[SkipSegment] = None
         self._player_skip_outro_segment: Optional[SkipSegment] = None
         self._player_skip_path_key = ""
@@ -1568,6 +1593,18 @@ class PlayerController(QObject):
         self._player_floating_mini: Optional[FloatingMiniPlayer] = None
         self._player_floating_mini_dismissed = False
         self._player_floating_mini_reset_pending = True
+        self._media_discovery_service = MediaDiscoveryService(DisabledMetadataProvider())
+        self._sources_candidates: List[Any] = []
+        self._sources_candidate_list: Optional[QListWidget] = None
+        self._sources_table: Optional[QTableWidget] = None
+        self._sources_status_label: Optional[QLabel] = None
+        self._media_editor_fields: Dict[str, QLineEdit] = {}
+        self._fonts_family_combo: Optional[QComboBox] = None
+        self._fonts_scale_slider: Optional[QSlider] = None
+        self._intro_animation_combo: Optional[QComboBox] = None
+        self._intro_animation_enabled_check: Optional[QCheckBox] = None
+        self._home_intro_effect: Optional[QGraphicsOpacityEffect] = None
+        self._home_intro_anim: Optional[QPropertyAnimation] = None
 
         # Watch Home scroll viewport for resize events
         try:
@@ -1596,6 +1633,7 @@ class PlayerController(QObject):
         # Search UI is initialized lazily on first Discover/Library/Settings visit.
         self._background_init_layer()
         self._shell_install_bottom_dock()
+        self._app_apply_typography()
         self._personalization_apply_current_theme()
         self._background_apply_for_current_page()
         self._touch_prepare_widget_tree(self.win)
@@ -2831,12 +2869,23 @@ class PlayerController(QObject):
 
         if search_tab and self._search_initialized:
             try:
-                if search_tab in {"discover", "library"} and self._search_tabs is not None:
+                tab_map = {
+                    "discover": getattr(self, "_search_sources_tab", None) or getattr(self, "_search_library_tab", None),
+                    "library": getattr(self, "_search_media_library_tab", None) or getattr(self, "_search_library_tab", None),
+                    "media": getattr(self, "_search_media_library_tab", None),
+                    "sources": getattr(self, "_search_sources_tab", None),
+                    "themes": getattr(self, "_search_themes_tab", None),
+                    "fonts": getattr(self, "_search_fonts_tab", None),
+                    "layout": getattr(self, "_search_layout_tab", None),
+                    "settings": getattr(self, "_search_personalize_tab", None),
+                }
+                target_tab = tab_map.get(str(search_tab))
+                if target_tab is not None and self._search_tabs is not None:
+                    self._search_tabs.setCurrentWidget(target_tab)
+                elif search_tab in {"discover", "library"} and self._search_tabs is not None:
                     target_tab = self._search_library_tab or self._search_discover_tab
                     if target_tab is not None:
                         self._search_tabs.setCurrentWidget(target_tab)
-                elif search_tab == "settings" and self._search_tabs is not None and self._search_personalize_tab is not None:
-                    self._search_tabs.setCurrentWidget(self._search_personalize_tab)
                 self._search_refresh_lists()
             except Exception as e:
                 dprint("[NAV][WARN] Could not select search tab:", e)
@@ -2857,12 +2906,25 @@ class PlayerController(QObject):
 
     def _nav_go_library(self) -> None:
         self._viewer_reset_search_filters_if_needed()
-        self._nav_set_page(self.searchPage, top_key="library", search_tab="library")
+        self._nav_set_page(self.searchPage, top_key="library", search_tab="media")
         if self._search_status_filter is not None:
             idx = self._search_status_filter.findText("All")
             if idx >= 0:
                 self._search_status_filter.setCurrentIndex(idx)
         self._library_refresh_hq(force=True)
+
+    def _nav_go_sources(self) -> None:
+        self._nav_set_page(self.searchPage, top_key="sources", search_tab="sources")
+        self._sources_refresh_page()
+
+    def _nav_go_themes(self) -> None:
+        self._nav_set_page(self.searchPage, top_key="themes", search_tab="themes")
+
+    def _nav_go_fonts(self) -> None:
+        self._nav_set_page(self.searchPage, top_key="fonts", search_tab="fonts")
+
+    def _nav_go_layout(self) -> None:
+        self._nav_set_page(self.searchPage, top_key="layout", search_tab="layout")
 
     def _nav_go_movies(self) -> None:
         self._nav_set_page(self.homePage, top_key="movies", home_mode="movies")
@@ -2951,8 +3013,12 @@ class PlayerController(QObject):
 
         defs = [
             ("home", "Home", self._nav_go_home),
-            ("library", "Library", self._nav_go_library),
+            ("library", "Media", self._nav_go_library),
+            ("sources", "Sources", self._nav_go_sources),
             ("mylist", "My List", self._nav_go_my_list),
+            ("themes", "Themes", self._nav_go_themes),
+            ("fonts", "Fonts", self._nav_go_fonts),
+            ("layout", "Layout", self._nav_go_layout),
             ("player", "Player", self._nav_go_player),
             ("settings", "Settings", self._nav_go_settings),
         ]
@@ -2993,7 +3059,11 @@ class PlayerController(QObject):
         navigate = menu_bar.addMenu("Navigate")
         for label, fn in [
             ("Home", self._nav_go_home),
-            ("Library", self._nav_go_library),
+            ("Media Library", self._nav_go_library),
+            ("Sources", self._nav_go_sources),
+            ("Themes", self._nav_go_themes),
+            ("Fonts / Typography", self._nav_go_fonts),
+            ("Layout", self._nav_go_layout),
             ("My List", self._nav_go_my_list),
             ("Now Playing", self._nav_go_player),
             ("Settings", self._nav_go_settings),
@@ -3285,9 +3355,11 @@ class PlayerController(QObject):
             # ------------------------------------------------------------
             if obj is self.win and event.type() in {QEvent.Show, QEvent.Hide, QEvent.WindowStateChange}:
                 QTimer.singleShot(0, self._shell_apply_visibility_power_mode)
+                QTimer.singleShot(0, self._home_update_startup_cover_geometry)
                 return False
 
             if obj is self.win and event.type() == QEvent.Resize:
+                self._home_update_startup_cover_geometry()
                 if self._player_should_reduce_surface_fx():
                     self._viewer_layout_startup_gate()
                     self._position_top_nav_bar()
@@ -4279,6 +4351,7 @@ class PlayerController(QObject):
         self._player_init_now_playing_title_label()
         self._player_init_playlist_drawer()
         self._player_init_segment_skip_controls()
+        self._player_init_chapter_controls()
         self._player_init_command_center()
         self._player_init_floating_mini_player()
 
@@ -4553,6 +4626,8 @@ class PlayerController(QObject):
             ):
                 add_widget(row, btn)
             add_widget(row, self.playerTimeLabel)
+            add_widget(row, self._player_prev_chapter_btn)
+            add_widget(row, self._player_next_chapter_btn)
             add_widget(row, self._player_skip_intro_btn)
             add_widget(row, self._player_skip_outro_btn)
             if self.playerSeekSlider is not None:
@@ -4590,6 +4665,8 @@ class PlayerController(QObject):
             ):
                 add_widget(top_row, btn)
             add_widget(top_row, self.playerTimeLabel)
+            add_widget(top_row, self._player_prev_chapter_btn)
+            add_widget(top_row, self._player_next_chapter_btn)
             add_widget(top_row, self._player_skip_intro_btn)
             add_widget(top_row, self._player_skip_outro_btn)
             if self.playerSeekSlider is not None:
@@ -5063,6 +5140,45 @@ class PlayerController(QObject):
             btn.clicked.connect(lambda: self._player_skip_segment("outro"))
             self._player_skip_outro_btn = btn
 
+    def _player_init_chapter_controls(self) -> None:
+        if self.playerPage is None:
+            return
+        if self._player_prev_chapter_btn is None:
+            btn = QPushButton("Prev Chapter", self.playerPage)
+            btn.setObjectName("playerPrevChapterBtn")
+            btn.setEnabled(False)
+            btn.clicked.connect(self._player_previous_chapter)
+            self._player_prev_chapter_btn = btn
+        if self._player_next_chapter_btn is None:
+            btn = QPushButton("Next Chapter", self.playerPage)
+            btn.setObjectName("playerNextChapterBtn")
+            btn.setEnabled(False)
+            btn.clicked.connect(self._player_next_chapter)
+            self._player_next_chapter_btn = btn
+
+    def _player_previous_chapter(self) -> None:
+        if self._mpv is None:
+            return
+        try:
+            self._mpv.previous_chapter()
+        except Exception as e:
+            dprint("[PLAYER][WARN] previous chapter failed:", e)
+
+    def _player_next_chapter(self) -> None:
+        if self._mpv is None:
+            return
+        try:
+            self._mpv.next_chapter()
+        except Exception as e:
+            dprint("[PLAYER][WARN] next chapter failed:", e)
+
+    def _player_update_chapter_buttons(self) -> None:
+        chapters = tuple(getattr(self, "_player_cached_chapters", ()) or ())
+        enabled = bool(chapters)
+        for btn in (self._player_prev_chapter_btn, self._player_next_chapter_btn):
+            if btn is not None:
+                btn.setEnabled(enabled)
+
     def _player_skip_flash_status(self, message: str) -> None:
         text = str(message or "").strip()
         if not text:
@@ -5107,6 +5223,7 @@ class PlayerController(QObject):
         for btn in (self._player_skip_intro_btn, self._player_skip_outro_btn):
             if btn is not None:
                 btn.hide()
+        self._player_update_chapter_buttons()
 
     def _player_refresh_segment_skip_state(self, cur_ms: int, dur_ms: int) -> None:
         with self._perf_track("player_segment_state"):
@@ -5154,6 +5271,8 @@ class PlayerController(QObject):
             else:
                 intro = self._player_skip_intro_segment
                 outro = self._player_skip_outro_segment
+
+            self._player_update_chapter_buttons()
 
             for kind, seg in (("intro", intro), ("outro", outro)):
                 if seg is None:
@@ -5294,6 +5413,8 @@ class PlayerController(QObject):
         configure_control_button(self.playerPlayPauseBtn, role="primary", text="Play", min_w=72, tooltip="Toggle play or pause")
         configure_control_button(self.playerFwdBtn, role="transport", text="+10s", min_w=54, tooltip="Seek forward 10 seconds")
         configure_control_button(self.playerNextBtn, role="transport", text="Next", min_w=54, tooltip="Next item")
+        configure_control_button(self._player_prev_chapter_btn, role="ghost", text="Prev Ch", min_w=70, tooltip="Previous chapter")
+        configure_control_button(self._player_next_chapter_btn, role="ghost", text="Next Ch", min_w=70, tooltip="Next chapter")
         configure_control_button(self._player_skip_intro_btn, role="accent", text=skip_intro_text, min_w=skip_min_w, tooltip="Skip the current intro segment")
         configure_control_button(self._player_skip_outro_btn, role="ghost", text=skip_outro_text, min_w=skip_min_w, tooltip="Skip the current outro or credits segment")
         for btn in (self._player_skip_intro_btn, self._player_skip_outro_btn):
@@ -7189,6 +7310,7 @@ class PlayerController(QObject):
         self._inline_expander_row_block: Optional[QWidget] = None
         self._rail_id_to_row_block: Dict[str, QWidget] = {}
         self._home_wire_tools_actions()
+        self._home_install_startup_cover()
 
 
 
@@ -7237,6 +7359,120 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
                 )
         except Exception:
             pass
+
+    def _home_install_startup_cover(self) -> None:
+        if self.homeScrollArea is None:
+            return
+        viewport = self.homeScrollArea.viewport()
+        if viewport is None:
+            return
+        cover = getattr(self, "_home_startup_cover", None)
+        if cover is None:
+            cover = QFrame(viewport)
+            cover.setObjectName("homeStartupCover")
+            cover.setAttribute(Qt.WA_StyledBackground, True)
+            cover.setStyleSheet("background: rgba(5,7,11,238); border: none;")
+            cover_l = QVBoxLayout(cover)
+            cover_l.setContentsMargins(34, 34, 34, 34)
+            cover_l.setSpacing(10)
+            cover_l.addStretch(1)
+            title = QLabel("OMEGA", cover)
+            title.setObjectName("homeStartupCoverTitle")
+            title.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+            status = QLabel(str(self.T.home.startup_status_text), cover)
+            status.setObjectName("homeStartupCoverStatus")
+            status.setAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+            cover_l.addWidget(title)
+            cover_l.addWidget(status)
+            cover_l.addStretch(1)
+            effect = QGraphicsOpacityEffect(cover)
+            effect.setOpacity(1.0)
+            cover.setGraphicsEffect(effect)
+            self._home_startup_cover = cover
+            self._home_startup_cover_title = title
+            self._home_startup_cover_status = status
+            self._home_startup_cover_fx = effect
+            self._home_startup_cover_anim = None
+        self._home_update_startup_cover_geometry()
+        self._home_show_startup_cover("startup")
+
+    def _home_update_startup_cover_geometry(self) -> None:
+        cover = getattr(self, "_home_startup_cover", None)
+        if cover is None or self.homeScrollArea is None:
+            return
+        viewport = self.homeScrollArea.viewport()
+        if viewport is None:
+            return
+        cover.setGeometry(viewport.rect())
+        cover.raise_()
+
+    def _home_show_startup_cover(self, reason: str) -> None:
+        cover = getattr(self, "_home_startup_cover", None)
+        if cover is None:
+            return
+        self._home_startup_cover_reason = str(reason or "startup")
+        self._home_startup_cover_active = True
+        self._home_startup_cover_ready = False
+        anim = getattr(self, "_home_startup_cover_anim", None)
+        if anim is not None:
+            try:
+                anim.stop()
+            except Exception:
+                pass
+        effect = getattr(self, "_home_startup_cover_fx", None)
+        if effect is not None:
+            effect.setOpacity(1.0)
+        status = getattr(self, "_home_startup_cover_status", None)
+        if status is not None:
+            status.setText(str(self.T.home.startup_status_text))
+        self._home_update_startup_cover_geometry()
+        cover.show()
+        cover.raise_()
+        dprint(f"[HOME][REVEAL] cover shown reason={self._home_startup_cover_reason}")
+
+    def _home_has_stable_viewport(self) -> bool:
+        if self.homeScrollArea is None:
+            return False
+        try:
+            viewport = self.homeScrollArea.viewport()
+            vw = int(viewport.width()) if viewport is not None else 0
+            vh = int(viewport.height()) if viewport is not None else 0
+        except Exception:
+            return False
+        return (
+            vw >= int(self.T.home.first_paint_min_viewport_w_px)
+            and vh >= int(self.T.home.first_paint_min_viewport_h_px)
+        )
+
+    def _home_mark_startup_cover_ready(self, reason: str) -> None:
+        cover = getattr(self, "_home_startup_cover", None)
+        if cover is None or not bool(getattr(self, "_home_startup_cover_active", False)):
+            return
+        self._home_startup_cover_ready = True
+        self._home_startup_cover_reason = str(reason or "ready")
+        effect = getattr(self, "_home_startup_cover_fx", None)
+        if effect is None:
+            cover.hide()
+            self._home_startup_cover_active = False
+            return
+        anim = QPropertyAnimation(effect, b"opacity", cover)
+        anim.setDuration(int(self.T.home.startup_cover_fade_ms))
+        anim.setStartValue(float(effect.opacity()))
+        anim.setEndValue(0.0)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.finished.connect(self._home_finish_startup_cover_hide)
+        self._home_startup_cover_anim = anim
+        anim.start()
+        dprint(f"[HOME][REVEAL] cover hide queued reason={self._home_startup_cover_reason}")
+
+    def _home_finish_startup_cover_hide(self) -> None:
+        cover = getattr(self, "_home_startup_cover", None)
+        effect = getattr(self, "_home_startup_cover_fx", None)
+        if effect is not None:
+            effect.setOpacity(0.0)
+        if cover is not None:
+            cover.hide()
+        self._home_startup_cover_active = False
 
     def _home_apply_scroll_policies(self) -> None:
         try:
@@ -10191,6 +10427,16 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         """
         try:
             if self.homeScrollArea is not None:
+                viewport = self.homeScrollArea.viewport()
+                if viewport is not None:
+                    vw = int(viewport.width())
+                    if vw > 50:
+                        return max(1, vw - self._home_show_selection_reserved_width(vw))
+        except Exception:
+            pass
+
+        try:
+            if self.homeScrollArea is not None:
                 sa_w = int(self.homeScrollArea.width())
                 if sa_w > 50:
                     reserve = self._home_show_selection_reserved_width(sa_w)
@@ -10211,14 +10457,6 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
                     stable = max(1, sa_w - max(0, reserve) - max(0, frame))
                     if stable > 50:
                         return stable
-        except Exception:
-            pass
-
-        try:
-            if self.homeScrollArea is not None:
-                vw = int(self.homeScrollArea.viewport().width())
-                if vw > 50:
-                    return max(1, vw - self._home_show_selection_reserved_width(vw))
         except Exception:
             pass
 
@@ -10398,6 +10636,10 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             return
         if not self._home_is_active_page():
             return
+        if not self._home_has_stable_viewport():
+            self._home_show_startup_cover("waiting-for-viewport")
+            dprint("[HOME][REBUILD] deferred until viewport is stable")
+            return
 
         if not self._home_runtime.request_rebuild_slot():
             dprint("[HOME][REBUILD] queued (inflight)")
@@ -10475,34 +10717,6 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         dprint("[TEMPLATE] Captured card template. root_size:", root_w, "x", root_h, "children:", list(children.keys()))
         return tmpl
 
-
-    # ============================================================
-    # STUBS / SAFETY (prevents crashes until you wire full features)
-    # ============================================================
-
-    def _thumbs_pump_done_queue(self) -> None:
-        try:
-            # If your EpisodeThumbnailer has a pump/done queue method, call it here.
-            # Keeping safe so the UI doesn't crash if thumbnailer is mid-refactor.
-            if hasattr(self, "_thumbs") and self._thumbs is not None:
-                if hasattr(self._thumbs, "pump_done_queue"):
-                    self._thumbs.pump_done_queue()
-        except Exception as e:
-            dprint("[THUMBS][WARN] pump_done_queue:", e)
-
-    def _thumbs_queue_missing_for_library(self) -> None:
-        try:
-            # Placeholder: later you'll scan library episodes and queue missing thumbs.
-            # For now: no-op to avoid breaking startup.
-            return
-        except Exception:
-            return
-
-    def _library_ui_add_source(self) -> None:
-        dprint("[TOOLS] Add source clicked (stub). Implement picker -> library.json add.")
-
-    def _ui_open_poster_art_dialog(self) -> None:
-        dprint("[TOOLS] Poster art dialog clicked (stub). Implement PosterArtDialog launch.")
 
     def _legacy_on_season_changed(self, *_args) -> None:
         # Legacy right-panel season dropdown handler (youÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¾ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢re using inline expander now).
@@ -11177,6 +11391,7 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         QTimer.singleShot(0, self._background_apply_for_current_page)
         QTimer.singleShot(0, self._force_player_edge_to_edge)
         QTimer.singleShot(0, self._shell_apply_visibility_power_mode)
+        QTimer.singleShot(0, self._home_play_intro_animation)
 
     def _viewer_poll_startup_gate_ready(self) -> None:
         if not bool(getattr(self, "_viewer_startup_gate_active", False)):
@@ -13601,6 +13816,11 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         if self._home_layout is None or self._show_card_template is None:
             dprint("[DEBUG][BUILD] Layout or template None - abort")
             return
+        if not self._home_has_stable_viewport():
+            self._home_pending_hidden_build = True
+            self._home_show_startup_cover("build-waiting-for-viewport")
+            dprint("[HOME][BUILD] deferred until viewport is stable")
+            return
 
         items = self._home_catalog_build_and_index()
 
@@ -13887,6 +14107,8 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         self._home_refresh_all_selection_highlights()
         self._home_position_show_selection_overlays()
         self._home_restore_inline_expander_if_needed()
+        if phase in {"initial", "deferred-complete", "reuse"}:
+            self._home_mark_startup_cover_ready(phase)
 
         started = float(getattr(self, "_home_build_started_at", 0.0) or 0.0)
         elapsed = float(time.time()) - started if started > 0 else 0.0
@@ -13931,8 +14153,8 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         title.setStyleSheet(self._title_bubble_stylesheet(compact=False))
         title.setObjectName("homeRailTitle")
         rail_title_font = QFont(title.font())
-        rail_title_font.setPointSize(max(rail_title_font.pointSize(), 12))
-        rail_title_font.setBold(True)
+        rail_title_font.setPointSize(max(rail_title_font.pointSize(), int(self.T.typography.rail_title_point_size)))
+        rail_title_font.setWeight(QFont.DemiBold)
         title.setFont(rail_title_font)
         title.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         title.setMinimumHeight(int(self.T.home.rail_title_min_h_px))
@@ -15914,6 +16136,31 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
 
         self._search_library_tab = self._search_discover_tab
 
+        self._search_media_library_tab = QWidget(self._search_tabs)
+        self._search_media_library_tab.setObjectName("searchMediaLibraryTab")
+        self._search_tabs.addTab(self._search_media_library_tab, "Media Library")
+        self._media_library_build_management_tab(self._search_media_library_tab)
+
+        self._search_sources_tab = QWidget(self._search_tabs)
+        self._search_sources_tab.setObjectName("searchSourcesTab")
+        self._search_tabs.addTab(self._search_sources_tab, "Sources")
+        self._sources_build_tab(self._search_sources_tab)
+
+        self._search_themes_tab = QWidget(self._search_tabs)
+        self._search_themes_tab.setObjectName("searchThemesTab")
+        self._search_tabs.addTab(self._search_themes_tab, "Themes")
+        self._themes_build_focused_tab(self._search_themes_tab)
+
+        self._search_fonts_tab = QWidget(self._search_tabs)
+        self._search_fonts_tab.setObjectName("searchFontsTab")
+        self._search_tabs.addTab(self._search_fonts_tab, "Fonts")
+        self._fonts_build_tab(self._search_fonts_tab)
+
+        self._search_layout_tab = QWidget(self._search_tabs)
+        self._search_layout_tab.setObjectName("searchLayoutTab")
+        self._search_tabs.addTab(self._search_layout_tab, "Layout")
+        self._layout_build_tabbed_page(self._search_layout_tab)
+
         self._search_personalize_tab = QWidget(self._search_tabs)
         self._search_personalize_tab.setObjectName("searchSettingsTab")
         self._search_tabs.addTab(self._search_personalize_tab, "Settings")
@@ -15952,6 +16199,491 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         self._settings_refresh_overview(force=True)
         self._apply_non_home_page_bottom_inset()
         QTimer.singleShot(0, self._glass_refresh_surface_backdrops)
+
+    def _make_page_scroll(self, tab: QWidget, *, margins: Tuple[int, int, int, int] = (12, 12, 12, 18)) -> Tuple[QWidget, QVBoxLayout]:
+        root = QVBoxLayout(tab)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        scroll = QScrollArea(tab)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        root.addWidget(scroll, 1)
+        body = QWidget(scroll)
+        body.setObjectName("omegaPageBody")
+        scroll.setWidget(body)
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(*margins)
+        lay.setSpacing(14)
+        return body, lay
+
+    def _media_library_build_management_tab(self, tab: QWidget) -> None:
+        body, lay = self._make_page_scroll(tab)
+        title = QLabel("Media Library", body)
+        title.setObjectName("settingsPageTitle")
+        lay.addWidget(title)
+
+        split = QSplitter(Qt.Horizontal, body)
+        split.setObjectName("mediaLibrarySplitter")
+        split.setChildrenCollapsible(False)
+        lay.addWidget(split, 1)
+
+        left = QFrame(split)
+        left.setObjectName("mediaLibraryListPanel")
+        left_l = QVBoxLayout(left)
+        left_l.setContentsMargins(12, 12, 12, 12)
+        left_l.setSpacing(8)
+        search_row = QHBoxLayout()
+        self._media_library_query = QLineEdit(left)
+        self._media_library_query.setPlaceholderText("Search managed titles")
+        self._media_library_type = FocusSafeComboBox(left)
+        self._media_library_type.addItems(["All", "Shows", "Movies", "Needs Review"])
+        search_row.addWidget(self._media_library_query, 1)
+        search_row.addWidget(self._media_library_type)
+        left_l.addLayout(search_row)
+        self._media_library_list = QListWidget(left)
+        self._media_library_list.setObjectName("mediaLibraryList")
+        self._media_library_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self._media_library_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_l.addWidget(self._media_library_list, 1)
+
+        right = QFrame(split)
+        right.setObjectName("mediaLibraryEditorPanel")
+        right_l = QVBoxLayout(right)
+        right_l.setContentsMargins(14, 14, 14, 14)
+        right_l.setSpacing(10)
+        editor_title = QLabel("Metadata & Art", right)
+        editor_title.setObjectName("settingsSectionTitle")
+        right_l.addWidget(editor_title)
+        form = QFormLayout()
+        self._media_editor_fields = {}
+        for key, label in (
+            ("title", "Title"),
+            ("year", "Year"),
+            ("type", "Type"),
+            ("path", "Local Path"),
+            ("poster", "Poster Override"),
+            ("backdrop", "Backdrop Override"),
+        ):
+            inp = QLineEdit(right)
+            inp.setObjectName(f"mediaEditor_{key}")
+            if key in {"path", "type"}:
+                inp.setReadOnly(True)
+            self._media_editor_fields[key] = inp
+            form.addRow(label, inp)
+        right_l.addLayout(form)
+        self._media_editor_overview = QLabel("Select a title to inspect metadata, paths, and artwork.", right)
+        self._media_editor_overview.setObjectName("settingsMutedText")
+        self._media_editor_overview.setWordWrap(True)
+        right_l.addWidget(self._media_editor_overview)
+        actions = QHBoxLayout()
+        save_btn = QPushButton("Apply Metadata", right)
+        art_btn = QPushButton("Choose Art", right)
+        rescan_btn = QPushButton("Rescan Item", right)
+        remove_btn = QPushButton("Remove", right)
+        save_btn.clicked.connect(self._media_library_apply_editor)
+        art_btn.clicked.connect(self._search_action_change_poster)
+        rescan_btn.clicked.connect(lambda: self._home_catalog_start_async_refresh("media-item-rescan", allow_network=True))
+        remove_btn.clicked.connect(self._search_action_unverify_selected)
+        for btn in (save_btn, art_btn, rescan_btn, remove_btn):
+            actions.addWidget(btn)
+        right_l.addLayout(actions)
+        right_l.addStretch(1)
+
+        split.addWidget(left)
+        split.addWidget(right)
+        split.setSizes([520, 620])
+        self._media_library_query.textChanged.connect(lambda _t: self._media_library_refresh_list())
+        self._media_library_type.currentIndexChanged.connect(lambda _i: self._media_library_refresh_list())
+        self._media_library_list.itemSelectionChanged.connect(self._media_library_on_selection)
+        QTimer.singleShot(0, self._media_library_refresh_list)
+
+    def _media_library_refresh_list(self) -> None:
+        widget = getattr(self, "_media_library_list", None)
+        if widget is None:
+            return
+        query = str(getattr(self, "_media_library_query", None).text() if getattr(self, "_media_library_query", None) is not None else "").strip().casefold()
+        type_filter = str(getattr(self, "_media_library_type", None).currentText() if getattr(self, "_media_library_type", None) is not None else "All").strip().casefold()
+        widget.clear()
+        for sg in list(self._home_catalog_items or []):
+            key = self._home_item_key(sg)
+            title = _ui_text(getattr(sg, "display_title", "") or "") or "Untitled"
+            media_type = str(getattr(sg, "media_type", "") or "").strip().casefold()
+            verified = key in self._home_state_verified_set()
+            if type_filter == "shows" and media_type == "movie":
+                continue
+            if type_filter == "movies" and media_type != "movie":
+                continue
+            if type_filter == "needs review" and verified:
+                continue
+            hay = f"{title} {getattr(sg, 'primary_dir', '')} {getattr(sg, 'year', '')}".casefold()
+            if query and query not in hay:
+                continue
+            item = QListWidgetItem(f"{title}  |  {'Movie' if media_type == 'movie' else 'Show'}")
+            item.setData(Qt.UserRole, key)
+            widget.addItem(item)
+
+    def _media_library_on_selection(self) -> None:
+        widget = getattr(self, "_media_library_list", None)
+        if widget is None or not widget.selectedItems():
+            return
+        key = str(widget.selectedItems()[0].data(Qt.UserRole) or "")
+        sg = getattr(self, "_home_items_by_key", {}).get(key) or getattr(self, "_search_by_key", {}).get(key)
+        if sg is None:
+            return
+        try:
+            self._search_selected_keys = {key}
+        except Exception:
+            pass
+        fields = getattr(self, "_media_editor_fields", {})
+        values = {
+            "title": _ui_text(getattr(sg, "display_title", "") or ""),
+            "year": "" if getattr(sg, "year", None) is None else str(getattr(sg, "year")),
+            "type": "Movie" if str(getattr(sg, "media_type", "")).casefold() == "movie" else "Show",
+            "path": str(getattr(sg, "primary_dir", "") or ""),
+            "poster": str(getattr(sg, "poster_path", "") or ""),
+            "backdrop": str(getattr(sg, "backdrop_path", "") or ""),
+        }
+        for name, value in values.items():
+            field = fields.get(name)
+            if field is not None:
+                field.setText(value)
+        if getattr(self, "_media_editor_overview", None) is not None:
+            self._media_editor_overview.setText(_ui_text(getattr(sg, "overview", "") or "No overview stored yet."))
+
+    def _media_library_apply_editor(self) -> None:
+        widget = getattr(self, "_media_library_list", None)
+        if widget is None or not widget.selectedItems():
+            return
+        key = str(widget.selectedItems()[0].data(Qt.UserRole) or "")
+        title_field = (getattr(self, "_media_editor_fields", {}) or {}).get("title")
+        title = str(title_field.text() if title_field is not None else "").strip()
+        if key and title:
+            self._home_state_set_title_override(key, title)
+            self._home_reindex_catalog_items_with_state(source="media-library-editor")
+            self._home_build()
+            self._search_request_refresh()
+            self._media_library_refresh_list()
+
+    def _sources_build_tab(self, tab: QWidget) -> None:
+        body, lay = self._make_page_scroll(tab)
+        title = QLabel("Sources", body)
+        title.setObjectName("settingsPageTitle")
+        lay.addWidget(title)
+        toolbar = QHBoxLayout()
+        add_btn = QPushButton("Add Source", body)
+        refresh_btn = QPushButton("Refresh Sources", body)
+        add_btn.clicked.connect(self._sources_add_source)
+        refresh_btn.clicked.connect(self._sources_refresh_page)
+        toolbar.addWidget(add_btn)
+        toolbar.addWidget(refresh_btn)
+        toolbar.addStretch(1)
+        lay.addLayout(toolbar)
+        self._sources_status_label = QLabel("Source health will appear here after refresh.", body)
+        self._sources_status_label.setObjectName("settingsMutedText")
+        lay.addWidget(self._sources_status_label)
+        self._sources_table = QTableWidget(0, 4, body)
+        self._sources_table.setObjectName("sourcesTable")
+        self._sources_table.setHorizontalHeaderLabels(["Folder", "Enabled", "Type", "Status"])
+        self._sources_table.horizontalHeader().setStretchLastSection(True)
+        self._sources_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._sources_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._sources_table.setMinimumHeight(190)
+        lay.addWidget(self._sources_table)
+        candidate_title = QLabel("Ready To Add", body)
+        candidate_title.setObjectName("settingsSectionTitle")
+        lay.addWidget(candidate_title)
+        self._sources_candidate_list = QListWidget(body)
+        self._sources_candidate_list.setObjectName("sourcesCandidateList")
+        self._sources_candidate_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self._sources_candidate_list.setMinimumHeight(360)
+        lay.addWidget(self._sources_candidate_list, 1)
+        QTimer.singleShot(0, self._sources_refresh_page)
+
+    def _sources_add_source(self) -> None:
+        chosen = self._library_ui_choose_source_dirs()
+        if not chosen:
+            return
+        try:
+            self._library.add_sources([str(p) for p in chosen])
+        except Exception as e:
+            dprint("[SOURCES][WARN] add source failed:", e)
+        self._home_catalog_needs_refresh = True
+        self._home_catalog_start_async_refresh("sources-page-add", allow_network=True)
+        self._sources_refresh_page()
+
+    def _sources_refresh_page(self) -> None:
+        table = getattr(self, "_sources_table", None)
+        candidates_widget = getattr(self, "_sources_candidate_list", None)
+        if table is None or candidates_widget is None:
+            return
+        sources = []
+        try:
+            sources = list(self._library.list_sources(enabled_only=False))
+        except Exception:
+            sources = []
+        table.setRowCount(len(sources))
+        enabled_paths: List[str] = []
+        for row, source in enumerate(sources):
+            path = str(getattr(source, "path", "") or "")
+            enabled = bool(getattr(source, "enabled", True))
+            if enabled:
+                enabled_paths.append(path)
+            exists = Path(path).exists()
+            values = [path, "Yes" if enabled else "No", "Auto", "Online" if exists else "Missing"]
+            for col, value in enumerate(values):
+                table.setItem(row, col, QTableWidgetItem(value))
+        try:
+            candidates = self._media_discovery_service.discover(enabled_paths, limit=260)
+        except Exception as e:
+            dprint("[SOURCES][WARN] discovery failed:", e)
+            candidates = []
+        self._sources_candidates = candidates
+        candidates_widget.clear()
+        for candidate in candidates:
+            quality = "Needs Review" if bool(candidate.needs_review) else "Ready"
+            count = f"{candidate.episode_count} episodes" if candidate.media_type == "show" else f"{candidate.file_count} file(s)"
+            item = QListWidgetItem(f"{candidate.title}  |  {candidate.media_type.title()}  |  {count}  |  {quality}")
+            item.setData(Qt.UserRole, candidate.candidate_id)
+            candidates_widget.addItem(item)
+        if self._sources_status_label is not None:
+            self._sources_status_label.setText(f"{len(sources)} source(s), {len(candidates)} polished add candidate(s). Refresh updates this live without restart.")
+        self._search_request_refresh()
+
+    def _themes_build_focused_tab(self, tab: QWidget) -> None:
+        body, lay = self._make_page_scroll(tab)
+        title = QLabel("Themes", body)
+        title.setObjectName("settingsPageTitle")
+        lay.addWidget(title)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(14)
+        for idx, name in enumerate(OMEGA_CURATED_THEME_NAMES):
+            card = QGroupBox(name, body)
+            card.setObjectName("themePreviewCard")
+            card_l = QVBoxLayout(card)
+            card_l.setContentsMargins(12, 12, 12, 12)
+            sample = ThemeMiniPreview(card)
+            try:
+                sample.setMinimumHeight(110)
+            except Exception:
+                pass
+            card_l.addWidget(sample)
+            meta = QLabel("Panel, card, button, input, and selected states share one token set.", card)
+            meta.setWordWrap(True)
+            meta.setObjectName("settingsMutedText")
+            card_l.addWidget(meta)
+            btn = QPushButton("Apply Theme", card)
+            btn.clicked.connect(lambda _checked=False, preset=name: self._themes_apply_named_preset(preset))
+            card_l.addWidget(btn)
+            grid.addWidget(card, idx // 2, idx % 2)
+        lay.addLayout(grid)
+        lay.addStretch(1)
+
+    def _themes_apply_named_preset(self, preset: str) -> None:
+        if str(preset) not in OMEGA_THEME_PRESETS:
+            return
+        self._personalization = self._personalization_default(str(preset))
+        self._personalization_save()
+        self._personalization_apply_current_theme()
+        self._personalization_sync_inputs_from_config()
+
+    def _fonts_build_tab(self, tab: QWidget) -> None:
+        body, lay = self._make_page_scroll(tab)
+        title = QLabel("Fonts / Typography", body)
+        title.setObjectName("settingsPageTitle")
+        lay.addWidget(title)
+        form = QFormLayout()
+        self._fonts_family_combo = FocusSafeComboBox(body)
+        try:
+            families = list(QFontDatabase.families())
+        except Exception:
+            families = []
+        preferred = self._typography_settings().get("family", self.T.typography.preferred_family)
+        for fam in ["Inter", "Segoe UI"] + [f for f in families if f not in {"Inter", "Segoe UI"}]:
+            self._fonts_family_combo.addItem(str(fam))
+        idx = self._fonts_family_combo.findText(str(preferred))
+        if idx >= 0:
+            self._fonts_family_combo.setCurrentIndex(idx)
+        self._fonts_scale_slider = PassiveWheelSlider(Qt.Horizontal, body)
+        self._fonts_scale_slider.setRange(85, 120)
+        self._fonts_scale_slider.setValue(int(self._typography_settings().get("scale", 100) or 100))
+        form.addRow("Font family", self._fonts_family_combo)
+        form.addRow("Global scale", self._fonts_scale_slider)
+        lay.addLayout(form)
+        preview = QLabel("OMEGA Preview\nPage title, section title, body, metadata, button text, and card captions use one scale.", body)
+        preview.setObjectName("settingsPreviewText")
+        preview.setWordWrap(True)
+        preview.setMinimumHeight(110)
+        lay.addWidget(preview)
+        row = QHBoxLayout()
+        apply_btn = QPushButton("Apply Typography", body)
+        reset_btn = QPushButton("Reset", body)
+        apply_btn.clicked.connect(self._fonts_apply_settings)
+        reset_btn.clicked.connect(self._fonts_reset_settings)
+        row.addWidget(apply_btn)
+        row.addWidget(reset_btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+        lay.addStretch(1)
+
+    def _typography_settings(self) -> Dict[str, Any]:
+        raw = self._personalization.get("typography", {})
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "family": str(raw.get("family") or self.T.typography.preferred_family or "Segoe UI"),
+            "scale": int(max(85, min(120, int(raw.get("scale", 100) or 100)))),
+        }
+
+    def _fonts_apply_settings(self) -> None:
+        family = str(self._fonts_family_combo.currentText() if self._fonts_family_combo is not None else "Segoe UI")
+        scale = int(self._fonts_scale_slider.value() if self._fonts_scale_slider is not None else 100)
+        self._personalization["typography"] = {"family": family, "scale": scale}
+        self._personalization_save()
+        self._app_apply_typography()
+        self._personalization_apply_current_theme()
+
+    def _fonts_reset_settings(self) -> None:
+        self._personalization["typography"] = {"family": "Segoe UI", "scale": 100}
+        self._personalization_save()
+        self._app_apply_typography()
+        self._personalization_apply_current_theme()
+        if self._fonts_family_combo is not None:
+            idx = self._fonts_family_combo.findText("Segoe UI")
+            if idx >= 0:
+                self._fonts_family_combo.setCurrentIndex(idx)
+        if self._fonts_scale_slider is not None:
+            self._fonts_scale_slider.setValue(100)
+
+    def _layout_build_tabbed_page(self, tab: QWidget) -> None:
+        root = QVBoxLayout(tab)
+        root.setContentsMargins(12, 12, 12, 18)
+        root.setSpacing(12)
+        title = QLabel("Layout", tab)
+        title.setObjectName("settingsPageTitle")
+        root.addWidget(title)
+        tabs = QTabWidget(tab)
+        tabs.setObjectName("layoutContextTabs")
+        root.addWidget(tabs, 1)
+        for key, label in (("home", "Home Layout"), ("player", "Player Layout"), ("library", "Library Layout"), ("settings", "Settings Layout")):
+            page = QWidget(tabs)
+            page_l = QVBoxLayout(page)
+            page_l.setContentsMargins(12, 12, 12, 12)
+            page_l.setSpacing(10)
+            page_l.addWidget(QLabel(f"{label} controls", page))
+            preview = PageLayoutMiniPreview(page)
+            preview.setMinimumHeight(260)
+            page_l.addWidget(preview, 1)
+            row = QHBoxLayout()
+            reset_btn = QPushButton("Reset This Layout", page)
+            apply_btn = QPushButton("Apply Saved Layout", page)
+            reset_btn.clicked.connect(lambda _checked=False, ctx=key: self._layout_reset_context(ctx))
+            apply_btn.clicked.connect(lambda _checked=False, ctx=key: self._layout_apply_context(ctx))
+            row.addWidget(reset_btn)
+            row.addWidget(apply_btn)
+            row.addStretch(1)
+            page_l.addLayout(row)
+            tabs.addTab(page, label)
+
+    def _layout_reset_context(self, key: str) -> None:
+        defaults = self._page_layouts_default()
+        if str(key) in defaults:
+            self._page_layouts[str(key)] = deepcopy(defaults[str(key)])
+            self._page_layouts_save()
+            self._search_apply_discover_layout_config(save=False)
+            self._settings_apply_modular_layout_config(save=False)
+
+    def _layout_apply_context(self, key: str) -> None:
+        if str(key) == "library":
+            self._search_apply_discover_layout_config(save=False)
+        elif str(key) == "settings":
+            self._settings_apply_modular_layout_config(save=False)
+        elif str(key) == "player":
+            self._player_apply_elite_layout()
+        else:
+            self._home_request_build()
+
+    def _settings_build_intro_animation_section(self, parent: QWidget, layout: QVBoxLayout) -> None:
+        group = QGroupBox("Startup & Home Intro", parent)
+        group.setObjectName("layoutStudioGroup")
+        group_l = QVBoxLayout(group)
+        group_l.setContentsMargins(16, 16, 16, 16)
+        group_l.setSpacing(10)
+        lead = QLabel("Choose how Omega reveals Home after profile entry. Animations are Qt-safe fades so layout measurement stays stable.", group)
+        lead.setObjectName("studioGroupLead")
+        lead.setWordWrap(True)
+        group_l.addWidget(lead)
+        row = QHBoxLayout()
+        self._intro_animation_enabled_check = QCheckBox("Enable intro animation", group)
+        self._intro_animation_enabled_check.setChecked(bool(self._intro_animation_settings().get("enabled", True)))
+        self._intro_animation_combo = FocusSafeComboBox(group)
+        self._intro_animation_combo.addItems([
+            "Rail Cascade",
+            "Cinematic Aperture",
+            "Glass Console Boot",
+            "Poster Constellation",
+            "Command Sweep",
+            "Minimal Fade",
+        ])
+        idx = self._intro_animation_combo.findText(str(self._intro_animation_settings().get("style", "Rail Cascade")))
+        if idx >= 0:
+            self._intro_animation_combo.setCurrentIndex(idx)
+        save_btn = QPushButton("Save Intro", group)
+        preview_btn = QPushButton("Preview", group)
+        save_btn.clicked.connect(self._intro_animation_save_settings)
+        preview_btn.clicked.connect(self._home_play_intro_animation)
+        row.addWidget(self._intro_animation_enabled_check)
+        row.addWidget(self._intro_animation_combo, 1)
+        row.addWidget(save_btn)
+        row.addWidget(preview_btn)
+        group_l.addLayout(row)
+        layout.addWidget(group)
+
+    def _intro_animation_settings(self) -> Dict[str, Any]:
+        raw = self._personalization.get("intro_animation", {})
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "enabled": bool(raw.get("enabled", True)),
+            "style": str(raw.get("style") or "Rail Cascade"),
+            "duration": str(raw.get("duration") or "Balanced"),
+        }
+
+    def _intro_animation_save_settings(self) -> None:
+        self._personalization["intro_animation"] = {
+            "enabled": bool(self._intro_animation_enabled_check.isChecked()) if self._intro_animation_enabled_check is not None else True,
+            "style": str(self._intro_animation_combo.currentText()) if self._intro_animation_combo is not None else "Rail Cascade",
+            "duration": "Balanced",
+        }
+        self._personalization_save()
+
+    def _home_play_intro_animation(self) -> None:
+        cfg = self._intro_animation_settings()
+        if not bool(cfg.get("enabled", True)):
+            return
+        target = self.homeContent if self.homeContent is not None else self.homePage
+        if target is None:
+            return
+        try:
+            if self._home_intro_anim is not None:
+                self._home_intro_anim.stop()
+        except Exception:
+            pass
+        effect = QGraphicsOpacityEffect(target)
+        target.setGraphicsEffect(effect)
+        effect.setOpacity(0.0)
+        anim = QPropertyAnimation(effect, b"opacity", self)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        style = str(cfg.get("style", "Rail Cascade"))
+        anim.setDuration(520 if style == "Minimal Fade" else 780)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.finished.connect(lambda: target.setGraphicsEffect(None))
+        self._home_intro_effect = effect
+        self._home_intro_anim = anim
+        anim.start()
 
     def _search_create_discover_dock(self, object_name: str, title: str, widget: QWidget) -> QDockWidget:
         host = self._search_discover_host
@@ -19416,6 +20148,8 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             "home_chrome": self._home_chrome_default(default_name),
             "player_chrome_windowed": self._player_chrome_default(default_name),
             "player_chrome_fullscreen": self._player_chrome_default(default_name),
+            "typography": {"family": str(self.T.typography.preferred_family or "Segoe UI"), "scale": 100},
+            "intro_animation": {"enabled": True, "style": "Rail Cascade", "duration": "Balanced"},
         }
 
     def _personalization_merge_from_state(self) -> None:
@@ -19465,6 +20199,22 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         fullscreen_player = raw.get("player_chrome_fullscreen", windowed_player)
         out["player_chrome_windowed"] = self._player_chrome_from_config(windowed_player)
         out["player_chrome_fullscreen"] = self._player_chrome_from_config(fullscreen_player)
+        typography = base.get("typography", {}) if isinstance(base.get("typography"), dict) else {}
+        if isinstance(raw.get("typography"), dict):
+            typography = dict(typography)
+            typography["family"] = str(raw.get("typography", {}).get("family") or typography.get("family") or "Segoe UI")
+            try:
+                typography["scale"] = int(max(85, min(120, int(raw.get("typography", {}).get("scale", typography.get("scale", 100)) or 100))))
+            except Exception:
+                typography["scale"] = 100
+        out["typography"] = typography
+        intro = base.get("intro_animation", {}) if isinstance(base.get("intro_animation"), dict) else {}
+        if isinstance(raw.get("intro_animation"), dict):
+            intro = dict(intro)
+            intro["enabled"] = bool(raw.get("intro_animation", {}).get("enabled", intro.get("enabled", True)))
+            intro["style"] = str(raw.get("intro_animation", {}).get("style") or intro.get("style") or "Rail Cascade")
+            intro["duration"] = str(raw.get("intro_animation", {}).get("duration") or intro.get("duration") or "Balanced")
+        out["intro_animation"] = intro
 
         self._personalization = out
         try:
@@ -21650,8 +22400,11 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             combo.blockSignals(True)
             combo.clear()
         cat = self._theme_category
+        curated_names = set(OMEGA_CURATED_THEME_NAMES or [])
         for name in sorted(OMEGA_THEME_PRESETS.keys(), key=self._theme_curated_sort_key):
             preset = OMEGA_THEME_PRESETS[name]
+            if curated_names and name not in curated_names:
+                continue
             if str(preset.get("category", "dark_transparent")) != cat:
                 continue
             if combo is not None:
@@ -21676,6 +22429,22 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
 
     def _theme_category_is_light(self, category: Optional[str]) -> bool:
         return str(category or "").strip().casefold().startswith("light")
+
+    def _theme_font_family_css(self) -> str:
+        typography = self._typography_settings() if isinstance(getattr(self, "_personalization", None), dict) else {}
+        preferred = str(typography.get("family") or self.T.typography.preferred_family or "Segoe UI").strip()
+        fallback = str(self.T.typography.fallback_family or "Inter").strip()
+        return f"'{preferred}', '{fallback}', 'Arial'"
+
+    def _app_apply_typography(self) -> None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        typography = self._typography_settings() if isinstance(getattr(self, "_personalization", None), dict) else {}
+        scale = float(typography.get("scale", 100) or 100) / 100.0
+        font = QFont(str(typography.get("family") or self.T.typography.preferred_family or "Segoe UI"))
+        font.setPointSize(max(8, int(round(float(self.T.typography.base_point_size) * scale))))
+        app.setFont(font)
 
     def _current_theme_category(self) -> str:
         preset_name = str(self._personalization.get("preset", "Aurora") or "Aurora")
@@ -22117,6 +22886,7 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         canvas_l.addWidget(hero)
 
         self._settings_build_overview(canvas, canvas_l)
+        self._settings_build_intro_animation_section(canvas, canvas_l)
         self._viewer_profile_build_studio(canvas, canvas_l)
 
         theme_group = QGroupBox("Theme Theater", canvas)
@@ -23382,6 +24152,11 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         is_solid = self._theme_category_is_solid(theme_category)
         is_transparent = not is_solid
         is_light = self._theme_category_is_light(theme_category)
+        font_family = self._theme_font_family_css()
+        section_title_px = int(self.T.typography.section_title_point_size)
+        page_title_px = int(self.T.typography.page_title_point_size)
+        rail_meta_px = int(self.T.typography.rail_meta_point_size)
+        button_px = int(self.T.typography.button_point_size)
 
         solid_container_bg = bg_hex if is_solid else "transparent"
         solid_scroll_bg = surface_soft if is_solid else "transparent"
@@ -23408,6 +24183,8 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
 
         css = f"""
         QWidget {{
+            font-family: {font_family};
+            font-size: {int(self.T.typography.base_point_size)}pt;
             color: {text};
             selection-background-color: rgba({pr_rgb[0]}, {pr_rgb[1]}, {pr_rgb[2]}, 118);
             selection-color: #FFFFFF;
@@ -23629,7 +24406,7 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         QLabel#topNavBrandTitle {{
             color: {text};
             background: transparent;
-            font-size: 15px;
+            font-size: {page_title_px}px;
             font-weight: 900;
             letter-spacing: 0.6px;
         }}
@@ -23668,6 +24445,7 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             border-radius: 12px;
             padding: 7px 12px;
             font-weight: 700;
+            font-size: {button_px}px;
         }}
         QPushButton:hover {{
             border: 1px solid rgba({pr_rgb[0]}, {pr_rgb[1]}, {pr_rgb[2]}, 210);
@@ -23701,9 +24479,22 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         QLabel#homeRailMeta {{
             color: {muted};
             background: transparent;
-            font-size: 11px;
+            font-size: {rail_meta_px}px;
             font-weight: 700;
             letter-spacing: 0.5px;
+        }}
+        QLabel#homeStartupCoverTitle {{
+            color: {text};
+            background: transparent;
+            font-size: {page_title_px + 6}px;
+            font-weight: 800;
+            letter-spacing: 1.8px;
+        }}
+        QLabel#homeStartupCoverStatus {{
+            color: {muted};
+            background: transparent;
+            font-size: {section_title_px}px;
+            font-weight: 600;
         }}
         QLabel#homeLoadingStatus {{
             color: {text};
@@ -23854,6 +24645,7 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             self.win.setStyleSheet(css)
         except Exception as e:
             dprint("[THEME][WARN] apply failed:", e)
+        self._app_apply_typography()
         try:
             apply_omega_palette(QApplication.instance(), merged, category=self._theme_category_for_preset(preset_name))
         except Exception:
@@ -26612,6 +27404,14 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         panel_l.addWidget(lead)
 
         entries = [
+            (
+                "2026-05-05-omega-library-settings-layout-metadata-revamp",
+                "Library, Settings, Layout, Metadata, Theme, Font, and Startup Revamp: navigation is split into focused Media Library, Sources, Themes, Fonts, Layout, Player, and Settings areas; source refresh now shows ready-to-add parsed candidates live; metadata/art editing has a cleaner master-detail surface; chapter controls were added to the player bar; and Home intro animation settings were introduced to reduce the old all-in-one Settings clutter.",
+            ),
+            (
+                "2026-05-05-omega-github-comprehensive-clean-pass",
+                "GitHub-Informed Comprehensive Clean Pass: Home now waits for a real viewport before revealing rails, startup feels cleaner, typography is standardized, and theme styling is more consistent across Home, Settings, and shared chrome.",
+            ),
             (
                 f"Omega {OMEGA_VERSION}",
                 "Settings now includes a local changelog panel, matching Echo's product-log pattern.",

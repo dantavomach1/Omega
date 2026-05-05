@@ -20,11 +20,10 @@ def main():
     apply_dark_palette(app)
 
     win = load_main_window()
+    _controller = PlayerController(win)
     win.show()
     win.raise_()
     win.activateWindow()
-
-    _controller = PlayerController(win)
 
     sys.exit(app.exec())
 

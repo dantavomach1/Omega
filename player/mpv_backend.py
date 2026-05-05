@@ -234,6 +234,38 @@ class MPVBackend:
         out.sort(key=lambda item: int(item.get("start_ms", 0) or 0))
         return out
 
+    def chapter_count(self) -> int:
+        return len(self.get_chapters())
+
+    def has_chapters(self) -> bool:
+        return self.chapter_count() > 0
+
+    def current_chapter(self) -> int:
+        try:
+            return int(self._get_property("chapter", -1) or -1)
+        except Exception:
+            return -1
+
+    def next_chapter(self) -> None:
+        if not self.has_chapters():
+            return
+        try:
+            self.player.command("add", "chapter", 1)
+            return
+        except Exception:
+            pass
+        self._set_property("chapter", max(0, self.current_chapter() + 1))
+
+    def previous_chapter(self) -> None:
+        if not self.has_chapters():
+            return
+        try:
+            self.player.command("add", "chapter", -1)
+            return
+        except Exception:
+            pass
+        self._set_property("chapter", max(0, self.current_chapter() - 1))
+
     def seek_seconds(self, target_sec: float) -> None:
         target = max(0.0, float(target_sec))
         try:
