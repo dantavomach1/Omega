@@ -27,6 +27,7 @@ class SelectedShowItem:
     show_dirs: List[Path]
     poster_path: Optional[Path] = None
     backdrop_path: Optional[Path] = None
+    title_id: str = ""
 
 
 class ShowSelectionTray(QWidget):
@@ -357,7 +358,13 @@ class ShowSelectionTray(QWidget):
         art_path = item.backdrop_path or item.poster_path
         if art_path is not None:
             try:
-                apply_poster(art, art_path, radius=14, fill_label=False)
+                apply_poster(
+                    art,
+                    art_path,
+                    radius=14,
+                    fill_label=False,
+                    cache_namespace=str(item.title_id or item.key or ""),
+                )
             except Exception:
                 pass
 

@@ -1519,6 +1519,71 @@ _LEGENDARY_THEME_PRESETS: Dict[str, Dict[str, Any]] = {
 
 OMEGA_THEME_PRESETS.update(_LEGENDARY_THEME_PRESETS)
 
+_FOLLOWUP_THEME_PRESETS: Dict[str, Dict[str, Any]] = {
+    "Carbon Copper": _preset(
+        "Carbon-black panels with copper projector light and restrained executive contrast.",
+        colors={"primary": "#C87942", "secondary": "#67B8A2", "background": "#070706", "background_alt": "#141311", "text": "#F6EFE7", "muted_text": "#BFAE9E", "card": "#1B1814", "overlay": "#0D0B09", "highlight": "#E1A06C", "border": "#3A2E25", "glow": "#C87942", "surface_soft": "#191612", "surface_strong": "#241E18", "chip": "#2B2119"},
+        category="dark",
+    ),
+    "Graphite Emerald": _preset(
+        "Dense graphite with emerald command highlights and quiet library-grade readability.",
+        colors={"primary": "#5BD39A", "secondary": "#7CA8FF", "background": "#070A09", "background_alt": "#111A16", "text": "#F0FAF5", "muted_text": "#A9C2B5", "card": "#17211C", "overlay": "#0B100E", "highlight": "#8DE4B7", "border": "#284238", "glow": "#5BD39A", "surface_soft": "#142019", "surface_strong": "#1A2A22", "chip": "#1E3329"},
+    ),
+    "Obsidian Violet": _preset(
+        "Obsidian black with violet studio light, moody without losing text contrast.",
+        colors={"primary": "#9B7CFF", "secondary": "#E08BC4", "background": "#050407", "background_alt": "#120F19", "text": "#F7F3FF", "muted_text": "#C2B3D4", "card": "#191421", "overlay": "#0A0710", "highlight": "#C0A8FF", "border": "#35294D", "glow": "#A487FF", "surface_soft": "#171220", "surface_strong": "#211932", "chip": "#281D3B"},
+        category="dark",
+    ),
+    "Titanium Blue": _preset(
+        "Titanium-grey structure with clean blue controls and a modern desktop finish.",
+        colors={"primary": "#6EA6FF", "secondary": "#8ED3E6", "background": "#0A0E13", "background_alt": "#151C25", "text": "#F3F7FC", "muted_text": "#B5C1CF", "card": "#1C242D", "overlay": "#0E1319", "highlight": "#9EC4FF", "border": "#334150", "glow": "#77AEFF", "surface_soft": "#172029", "surface_strong": "#202B36", "chip": "#253241"},
+    ),
+    "Storm Cloud": _preset(
+        "Stormy blue-grey panels, cool borders, and soft cinema contrast.",
+        colors={"primary": "#8EB6FF", "secondary": "#A5C4D6", "background": "#080D12", "background_alt": "#141D26", "text": "#F1F6FA", "muted_text": "#B2BEC8", "card": "#1A242E", "overlay": "#0B1117", "highlight": "#B2CCFF", "border": "#344654", "glow": "#8EB6FF", "surface_soft": "#17212A", "surface_strong": "#202D38", "chip": "#253643"},
+    ),
+    "Smoke & Steel": _preset(
+        "Smoky charcoal, steel borders, and minimal neutral accents for a serious workspace.",
+        colors={"primary": "#B8C2D0", "secondary": "#7FD0C0", "background": "#080909", "background_alt": "#151718", "text": "#F2F4F5", "muted_text": "#B0B7BD", "card": "#1C1F21", "overlay": "#0E0F10", "highlight": "#D4DAE2", "border": "#363D42", "glow": "#A7B4C2", "surface_soft": "#181B1D", "surface_strong": "#23272A", "chip": "#2B3034"},
+        category="dark",
+    ),
+    "Arctic Frost": _preset(
+        "Clean frosted daylight theme with blue accents and careful contrast.",
+        category="light_transparent",
+        colors={"primary": "#4F7DDE", "secondary": "#6BAFCB", "background": "#F3F7FC", "background_alt": "#E7EEF7", "text": "#1E2938", "muted_text": "#647386", "card": "#FFFFFF", "overlay": "#DCE5F0", "highlight": "#8AA8ED", "border": "#C7D3E2", "glow": "#9BB5F0", "surface_soft": "#F8FAFD", "surface_strong": "#EDF3F9", "chip": "#E4ECF5"},
+    ),
+    "Ivory Studio": _preset(
+        "Warm ivory studio light with graphite text and editorial restraint.",
+        category="light_transparent",
+        colors={"primary": "#8A6B3D", "secondary": "#537DA6", "background": "#F7F2E8", "background_alt": "#ECE3D5", "text": "#29251F", "muted_text": "#71675B", "card": "#FFFDF8", "overlay": "#E2D8CA", "highlight": "#B9935F", "border": "#D4C8B8", "glow": "#C8A875", "surface_soft": "#FAF6EF", "surface_strong": "#EFE7DB", "chip": "#E7DCCF"},
+    ),
+    "Matrix Terminal": _preset(
+        "Tasteful terminal green over black glass, high contrast but not novelty-neon.",
+        colors={"primary": "#64D888", "secondary": "#A7E55E", "background": "#020503", "background_alt": "#07100A", "text": "#E9FFEF", "muted_text": "#9BCDA8", "card": "#0B1510", "overlay": "#030804", "highlight": "#9BF0AE", "border": "#1D4229", "glow": "#64D888", "surface_soft": "#09140D", "surface_strong": "#102018", "chip": "#132C1C"},
+        category="dark",
+    ),
+    "Plasma Noir": _preset(
+        "Noir shell with plasma magenta and blue energy for a premium night-club variant.",
+        colors={"primary": "#E065FF", "secondary": "#5CC8FF", "background": "#05040A", "background_alt": "#111020", "text": "#FAF3FF", "muted_text": "#C6B5D3", "card": "#19162A", "overlay": "#090711", "highlight": "#F0A2FF", "border": "#3A2E59", "glow": "#E065FF", "surface_soft": "#171426", "surface_strong": "#221D37", "chip": "#2A2145"},
+    ),
+    "Bronze Theater": _preset(
+        "Bronze marquee warmth with dark velvet surfaces and readable controls.",
+        colors={"primary": "#C99652", "secondary": "#B65C47", "background": "#080604", "background_alt": "#17100C", "text": "#F8EFE3", "muted_text": "#C7B19A", "card": "#1D1510", "overlay": "#0F0A07", "highlight": "#E2B678", "border": "#3F2C1F", "glow": "#CA9652", "surface_soft": "#1B130E", "surface_strong": "#281C14", "chip": "#302116"},
+        category="dark",
+    ),
+    "Navy Gold": _preset(
+        "Deep navy walls with gold trim and private-screening elegance.",
+        colors={"primary": "#D8B866", "secondary": "#6BA6E8", "background": "#050B15", "background_alt": "#0E1A2B", "text": "#F7F3E8", "muted_text": "#C2B895", "card": "#152238", "overlay": "#08111D", "highlight": "#EED286", "border": "#344567", "glow": "#D8B866", "surface_soft": "#132039", "surface_strong": "#1A2A49", "chip": "#223450"},
+    ),
+    "Black Ice": _preset(
+        "Near-black glass, icy blue highlights, and crisp high-contrast panel work.",
+        colors={"primary": "#8CD9FF", "secondary": "#A8B7FF", "background": "#020406", "background_alt": "#091017", "text": "#F4FBFF", "muted_text": "#A8B9C7", "card": "#0D151D", "overlay": "#04080C", "highlight": "#C2EEFF", "border": "#20384A", "glow": "#8CD9FF", "surface_soft": "#0A1219", "surface_strong": "#101C27", "chip": "#152B3A"},
+        category="dark",
+    ),
+}
+
+OMEGA_THEME_PRESETS.update(_FOLLOWUP_THEME_PRESETS)
+
 _THEME_ART_DIRECTION: Dict[str, Dict[str, Any]] = {
     "Aurora": {
         "home_chrome": {"top_nav_variant": "editorial", "dock_variant": "default"},

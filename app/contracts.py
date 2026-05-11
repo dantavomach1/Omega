@@ -43,6 +43,24 @@ class ShowGroup:
     backdrop_path: Optional[Path] = None
     classification_reason: str = ""
     episode_paths: Tuple[Path, ...] = ()
+    title_id: str = ""
+    status: str = "ready"
+    source_path: str = ""
+    source_status: str = "available"
+    source_enabled: bool = True
+    created_at: int = 0
+    updated_at: int = 0
+    last_scanned_at: int = 0
+    metadata_updated_at: int = 0
+    art_updated_at: int = 0
+    warnings: Tuple[str, ...] = ()
+    errors: Tuple[str, ...] = ()
+    duplicate_paths: Tuple[Path, ...] = ()
+    duplicate_of: str = ""
+    metadata_source: str = ""
+    art_source: str = ""
+    file_count: int = 0
+    episode_count: int = 0
 
 @dataclass(frozen=True)
 class EpisodeRef:

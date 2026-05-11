@@ -14,6 +14,12 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPainter, QPainterPath, QPixmap, QRegion
 from PySide6.QtWidgets import QLabel, QWidget
 
+try:
+    from omega.ui.qt_utils import dprint as _dprint
+except Exception:  # pragma: no cover - debug logging is optional
+    def _dprint(*args, **kwargs):  # type: ignore[no-redef]
+        return None
+
 
 _SOURCE_PIXMAP_CACHE_LIMIT = 96
 _DERIVED_PIXMAP_CACHE_LIMIT = 256
@@ -39,16 +45,25 @@ class ArtworkVariantSpec:
     height: int
     radius: int = 0
     mode: str = "cover"
+    cache_namespace: str = ""
 
 
 def _spec_cache_key(spec: ArtworkVariantSpec) -> str:
-    return _variant_cache_key(spec.image_path, spec.mode, spec.width, spec.height, spec.radius)
+    return _variant_cache_key(
+        spec.image_path,
+        spec.mode,
+        spec.width,
+        spec.height,
+        spec.radius,
+        cache_namespace=spec.cache_namespace,
+    )
 
 
 def _cache_get(cache: "OrderedDict[str, QPixmap]", key: str) -> QPixmap:
     pixmap = cache.get(str(key), QPixmap())
     if pixmap.isNull():
         return QPixmap()
+    _dprint(f"[ART][CACHE] memory-hit key={str(key)[:96]}")
     cache.move_to_end(str(key))
     return pixmap
 
@@ -58,6 +73,7 @@ def _cache_put(cache: "OrderedDict[str, QPixmap]", key: str, pixmap: QPixmap, li
         return QPixmap()
     cache[str(key)] = pixmap
     cache.move_to_end(str(key))
+    _dprint(f"[ART][CACHE] memory-store key={str(key)[:96]}")
     while len(cache) > int(max(1, limit)):
         cache.popitem(last=False)
     return pixmap
@@ -106,7 +122,15 @@ def configure_artwork_variant_cache(cache_dir: Optional[Path]) -> None:
     _ARTWORK_VARIANT_CACHE_DIR = root
 
 
-def _variant_cache_key(image_path: Optional[Path], mode: str, w: int, h: int, radius: int) -> str:
+def _variant_cache_key(
+    image_path: Optional[Path],
+    mode: str,
+    w: int,
+    h: int,
+    radius: int,
+    *,
+    cache_namespace: str = "",
+) -> str:
     path_key = _path_cache_key(image_path)
     if not path_key:
         return ""
@@ -114,8 +138,9 @@ def _variant_cache_key(image_path: Optional[Path], mode: str, w: int, h: int, ra
     target_h = max(1, int(h))
     target_radius = max(0, int(radius))
     mode_key = "rounded" if str(mode or "").strip().casefold() == "rounded" else "cover"
+    namespace_key = str(cache_namespace or "").strip()
     return (
-        f"variant:v{int(_ARTWORK_VARIANT_CACHE_VERSION)}|{mode_key}|"
+        f"variant:v{int(_ARTWORK_VARIANT_CACHE_VERSION)}|{namespace_key}|{mode_key}|"
         f"{path_key}|{target_w}x{target_h}|r{target_radius}"
     )
 
@@ -130,6 +155,7 @@ def _variant_disk_path(cache_key: str) -> Optional[Path]:
 def _load_variant_pixmap(cache_key: str) -> QPixmap:
     disk_path = _variant_disk_path(cache_key)
     if disk_path is None or not disk_path.exists():
+        _dprint(f"[ART][CACHE] disk-miss key={str(cache_key)[:96]}")
         return QPixmap()
     pixmap = QPixmap(str(disk_path))
     if pixmap.isNull():
@@ -137,7 +163,9 @@ def _load_variant_pixmap(cache_key: str) -> QPixmap:
             disk_path.unlink()
         except Exception:
             pass
+        _dprint(f"[ART][CACHE] disk-corrupt key={str(cache_key)[:96]}")
         return QPixmap()
+    _dprint(f"[ART][CACHE] disk-hit key={str(cache_key)[:96]}")
     return pixmap
 
 
@@ -265,8 +293,16 @@ def _ensure_variant_file(
     return disk_path if disk_path.exists() else None
 
 
-def _pixmap_from_variant(image_path: Optional[Path], mode: str, w: int, h: int, radius: int) -> QPixmap:
-    cache_key = _variant_cache_key(image_path, mode, w, h, radius)
+def _pixmap_from_variant(
+    image_path: Optional[Path],
+    mode: str,
+    w: int,
+    h: int,
+    radius: int,
+    *,
+    cache_namespace: str = "",
+) -> QPixmap:
+    cache_key = _variant_cache_key(image_path, mode, w, h, radius, cache_namespace=cache_namespace)
     if not cache_key:
         return QPixmap()
 
@@ -310,6 +346,7 @@ def _normalize_variant_spec(spec: ArtworkVariantSpec) -> Optional[ArtworkVariant
         height=target_h,
         radius=target_radius,
         mode=mode,
+        cache_namespace=str(getattr(spec, "cache_namespace", "") or ""),
     )
 
 
@@ -491,17 +528,31 @@ def apply_rounded_mask(widget: Optional[QWidget], radius: int) -> None:
         pass
 
 
-def cover_pixmap_cached(image_path: Optional[Path], w: int, h: int) -> QPixmap:
+def cover_pixmap_cached(image_path: Optional[Path], w: int, h: int, *, cache_namespace: str = "") -> QPixmap:
     target_w = max(1, int(w))
     target_h = max(1, int(h))
-    return _pixmap_from_variant(image_path, "cover", target_w, target_h, 0)
+    return _pixmap_from_variant(image_path, "cover", target_w, target_h, 0, cache_namespace=cache_namespace)
 
 
-def rounded_cover_pixmap_cached(image_path: Optional[Path], w: int, h: int, radius: int) -> QPixmap:
+def rounded_cover_pixmap_cached(
+    image_path: Optional[Path],
+    w: int,
+    h: int,
+    radius: int,
+    *,
+    cache_namespace: str = "",
+) -> QPixmap:
     target_w = max(1, int(w))
     target_h = max(1, int(h))
     target_radius = max(0, int(radius))
-    return _pixmap_from_variant(image_path, "rounded", target_w, target_h, target_radius)
+    return _pixmap_from_variant(
+        image_path,
+        "rounded",
+        target_w,
+        target_h,
+        target_radius,
+        cache_namespace=cache_namespace,
+    )
 
 
 def apply_poster(
@@ -509,6 +560,8 @@ def apply_poster(
     poster_path: Optional[Path],
     radius: int = 18,
     fill_label: bool = False,
+    *,
+    cache_namespace: str = "",
 ) -> None:
     """
     Apply a poster image to a QLabel using true center-crop + rounded corners.
@@ -546,7 +599,13 @@ def apply_poster(
     if target_w <= 1 or target_h <= 1:
         return
 
-    rounded = rounded_cover_pixmap_cached(poster_path, target_w, target_h, radius=radius)
+    rounded = rounded_cover_pixmap_cached(
+        poster_path,
+        target_w,
+        target_h,
+        radius=radius,
+        cache_namespace=cache_namespace,
+    )
     if rounded.isNull():
         return
 

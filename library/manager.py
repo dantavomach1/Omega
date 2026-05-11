@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .repository import LibraryBatchSummary, LibraryHealthReport, LibraryRepository
+
 
 # ============================================================
 # Data types
@@ -20,6 +22,11 @@ class LibrarySource:
     """
     path: Path
     enabled: bool = True
+    added_at: int = 0
+    label: str = ""
+    status: str = "available"
+    error: str = ""
+    source_id: str = ""
 
 
 @dataclass
@@ -73,9 +80,13 @@ class LibraryManager:
 
     def __init__(self, paths: Optional[LibraryPaths] = None) -> None:
         self.paths = paths or LibraryPaths.from_here()
+        self.repository = LibraryRepository(
+            self.paths.library_json,
+            backup_dir=self.paths.media_dir / ".omega_cache" / "library_backups",
+        )
 
         # In-memory library data
-        self._data: Dict[str, Any] = {}
+        self._data: Dict[str, Any] = self.repository.data
 
         # Ensure directories exist (first run safety)
         self.paths.media_dir.mkdir(parents=True, exist_ok=True)
@@ -83,8 +94,12 @@ class LibraryManager:
         self.paths.movies_dir.mkdir(parents=True, exist_ok=True)
         self.paths.config_dir.mkdir(parents=True, exist_ok=True)
 
-        # Load/create library.json
+        # Load/create library.json through the durable repository layer.
         self.load_or_init()
+
+    @property
+    def data(self) -> Dict[str, Any]:
+        return self._data
 
     # -------------------------
     # Load / Save
@@ -95,29 +110,13 @@ class LibraryManager:
         Load Media/library.json if present; otherwise initialize defaults.
         Always guarantees required keys exist.
         """
-        if self.paths.library_json.exists():
-            try:
-                self._data = json.loads(self.paths.library_json.read_text(encoding="utf-8"))
-            except Exception:
-                # Corrupt JSON shouldn't brick the app.
-                self._data = self._empty_library()
-        else:
-            self._data = self._empty_library()
-
-        self._data.setdefault("version", 1)
-        self._data.setdefault("sources", [])
-        self._data.setdefault("shows", [])
-        self._data.setdefault("movies", [])
-        self._data.setdefault("updated_at", None)
-
+        self._data = self.repository.load()
         return self._data
 
     def save(self) -> None:
         """Persist in-memory library to Media/library.json."""
-        self.paths.library_json.write_text(
-            json.dumps(self._data, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        self.repository.save()
+        self._data = self.repository.data
 
     # -------------------------
     # Sources API (what controller.py expects)
@@ -127,22 +126,23 @@ class LibraryManager:
         """
         Return sources as LibrarySource objects (with .path and .enabled).
         """
-        raw = self._data.get("sources", [])
         sources: List[LibrarySource] = []
-
-        # Support both formats:
-        # 1) ["C:\\path1", "D:\\path2"]
-        # 2) [{"path":"C:\\path1","enabled":true}, ...]
-        if isinstance(raw, list):
-            for item in raw:
-                if isinstance(item, str):
-                    p = Path(item)
-                    sources.append(LibrarySource(path=p, enabled=True))
-                elif isinstance(item, dict):
-                    p = Path(item.get("path", "")).expanduser()
-                    enabled = bool(item.get("enabled", True))
-                    if str(p).strip():
-                        sources.append(LibrarySource(path=p, enabled=enabled))
+        for item in self.source_records():
+            path = str(item.get("path", "") or "").strip()
+            if not path:
+                continue
+            enabled = bool(item.get("enabled", True))
+            sources.append(
+                LibrarySource(
+                    path=Path(path),
+                    enabled=enabled,
+                    added_at=int(item.get("added_at", 0) or 0),
+                    label=str(item.get("label", "") or ""),
+                    status=str(item.get("status", "available") or "available"),
+                    error=str(item.get("error", "") or ""),
+                    source_id=str(item.get("source_id", "") or ""),
+                )
+            )
 
         if enabled_only:
             sources = [s for s in sources if s.enabled]
@@ -162,12 +162,21 @@ class LibraryManager:
         """
         payload: List[Dict[str, Any]] = []
         for s in sources:
-            payload.append({"path": str(Path(s.path).expanduser()), "enabled": bool(s.enabled)})
+            path = str(Path(s.path).expanduser())
+            payload.append(
+                {
+                    "path": path,
+                    "enabled": bool(s.enabled),
+                    "added_at": int(getattr(s, "added_at", 0) or 0),
+                    "label": str(getattr(s, "label", "") or ""),
+                    "status": str(getattr(s, "status", "available") or "available"),
+                    "error": str(getattr(s, "error", "") or ""),
+                    "source_id": str(getattr(s, "source_id", "") or ""),
+                }
+            )
 
-        self._data["sources"] = payload
-        self.save()
-
-        # Also mirror to config/sources.json for convenience/legacy tools
+        self.repository.set_source_records(payload)
+        self._data = self.repository.data
         self._write_sources_json([d["path"] for d in payload])
 
     def add_source(self, path: str, enabled: bool = True) -> bool:
@@ -194,30 +203,11 @@ class LibraryManager:
             duplicates  -> normalized directories already present or repeated in input
             invalid     -> raw path strings that could not be used
         """
-        current = self.list_sources(enabled_only=False)
-        seen_keys = {self._source_key(src.path) for src in current}
-        added: List[Path] = []
-        duplicates: List[Path] = []
-        invalid: List[str] = []
-
-        for raw_path in paths or []:
-            normalized = self._normalize_source_path(raw_path)
-            if normalized is None:
-                invalid.append(str(raw_path or ""))
-                continue
-
-            key = self._source_key(normalized)
-            if key in seen_keys:
-                duplicates.append(normalized)
-                continue
-
-            seen_keys.add(key)
-            current.append(LibrarySource(path=normalized, enabled=bool(enabled)))
-            added.append(normalized)
-
+        payload = [{"path": str(p or ""), "enabled": bool(enabled)} for p in paths or []]
+        added, duplicates, invalid = self.repository.upsert_source_records(payload, enabled=enabled)
+        self._data = self.repository.data
         if added:
-            self.set_sources(current)
-
+            self._write_sources_json([str(src.path) for src in self.list_sources(enabled_only=False)])
         return added, duplicates, invalid
 
     def set_source_enabled(self, path: object, enabled: bool) -> bool:
@@ -230,18 +220,19 @@ class LibraryManager:
         if not wanted:
             return False
 
-        current = self.list_sources(enabled_only=False)
+        records = self.source_records()
         changed = False
-        for src in current:
-            if self._source_key(src.path) != wanted:
+        for src in records:
+            if self._source_key_from_unknown(src.get("path", "")) != wanted:
                 continue
             desired = bool(enabled)
-            if bool(src.enabled) != desired:
-                src.enabled = desired
+            if bool(src.get("enabled", True)) != desired:
+                src["enabled"] = desired
                 changed = True
-
         if changed:
-            self.set_sources(current)
+            self.repository.set_source_records(records)
+            self._data = self.repository.data
+            self._write_sources_json([str(src.get("path", "")) for src in records if str(src.get("path", "")).strip()])
         return changed
 
     def remove_source(self, path: object) -> bool:
@@ -254,13 +245,78 @@ class LibraryManager:
         if not wanted:
             return False
 
-        current = self.list_sources(enabled_only=False)
-        kept = [src for src in current if self._source_key(src.path) != wanted]
+        current = self.source_records()
+        kept = [src for src in current if self._source_key_from_unknown(src.get("path", "")) != wanted]
         if len(kept) == len(current):
             return False
 
-        self.set_sources(kept)
+        self.repository.set_source_records(kept)
+        self._data = self.repository.data
+        self._write_sources_json([str(src.get("path", "")) for src in kept if str(src.get("path", "")).strip()])
         return True
+
+    def source_records(self) -> List[Dict[str, Any]]:
+        return self.repository.source_records()
+
+    def load_title_groups(self) -> List[Any]:
+        return self.repository.load_title_groups()
+
+    def load_title_records(self) -> List[Dict[str, Any]]:
+        return self.repository.load_title_records()
+
+    def commit_title_groups(
+        self,
+        items: Sequence[Any],
+        *,
+        source_label: str,
+        batch_id: str,
+        worker_count: int,
+    ) -> LibraryBatchSummary:
+        summary = self.repository.commit_title_groups(
+            items,
+            source_label=source_label,
+            batch_id=batch_id,
+            worker_count=worker_count,
+        )
+        self._data = self.repository.data
+        return summary
+
+    def latest_errors(self) -> List[str]:
+        return self.repository.latest_errors()
+
+    def record_ingestion_start(
+        self,
+        *,
+        batch_id: str,
+        source_label: str,
+        worker_count: int,
+        candidate_count: int = 0,
+    ) -> None:
+        self.repository.record_ingestion_start(
+            batch_id=batch_id,
+            source_label=source_label,
+            worker_count=worker_count,
+            candidate_count=candidate_count,
+        )
+        self._data = self.repository.data
+
+    def record_ingestion_finish(
+        self,
+        *,
+        batch_id: str,
+        summary: Optional[LibraryBatchSummary] = None,
+        error: str = "",
+    ) -> None:
+        self.repository.record_ingestion_finish(batch_id=batch_id, summary=summary, error=error)
+        self._data = self.repository.data
+
+    def health_check(self) -> LibraryHealthReport:
+        return self.repository.health_check()
+
+    def repair_index(self) -> Tuple[LibraryHealthReport, bool]:
+        report, changed = self.repository.repair_index()
+        self._data = self.repository.data
+        return report, changed
 
     def ensure_default_source(self) -> bool:
         """
@@ -271,22 +327,6 @@ class LibraryManager:
         if current:
             return False
 
-        default_source = LibrarySource(path=self.paths.shows_dir, enabled=True)
-        self.set_sources([default_source])
-        return True
-
-        """
-        Best-practice behavior:
-        If there are NO sources at all, automatically add the local Media folder
-        (and/or Shows folder) so Home isn't blank on fresh installs.
-
-        Returns True if it added something.
-        """
-        current = self.list_sources(enabled_only=False)
-        if current:
-            return False
-
-        # Default: use Media/Shows as a "source root" (matches your app structure)
         default_source = LibrarySource(path=self.paths.shows_dir, enabled=True)
         self.set_sources([default_source])
         return True
@@ -349,9 +389,32 @@ class LibraryManager:
 
     def _empty_library(self) -> Dict[str, Any]:
         return {
-            "version": 1,
+            "version": 2,
             "sources": [],
+            "titles": [],
             "shows": [],
             "movies": [],
             "updated_at": None,
+            "last_scan_at": 0,
+            "last_successful_commit_at": 0,
+            "last_repair_at": 0,
+            "latest_errors": [],
+            "quarantined": [],
+            "ingestion": {
+                "active": False,
+                "status": "idle",
+                "batch_id": "",
+                "reason": "",
+                "source_label": "",
+                "candidate_count": 0,
+                "imported_count": 0,
+                "updated_count": 0,
+                "skipped_duplicate_count": 0,
+                "failed_count": 0,
+                "worker_count": 0,
+                "started_at": 0,
+                "finished_at": 0,
+                "elapsed_s": 0.0,
+                "error": "",
+            },
         }

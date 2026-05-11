@@ -3,7 +3,7 @@
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
@@ -99,7 +99,16 @@ class HomeCatalogService:
             out: List[ShowGroup] = []
             for sg in all_seed:
                 self._raise_if_cancelled()
-                out.append(self._enrich_group(sg))
+                try:
+                    out.append(self._enrich_group(sg))
+                except CatalogBuildCancelled:
+                    raise
+                except Exception as exc:
+                    self._warnings.append(
+                        f"[CATALOG][ERROR] {str(getattr(sg, 'display_title', '') or getattr(sg, 'primary_dir', '') or 'title')}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    out.append(self._mark_failed_group(sg, exc))
 
             movies_out = [x for x in out if str(getattr(x, "media_type", "")).casefold() == "movie"]
             tv_out = [x for x in out if str(getattr(x, "media_type", "tv")).casefold() != "movie"]
@@ -355,6 +364,11 @@ class HomeCatalogService:
                     content_key=content_key,
                     classification_reason="loose-episode-bundle",
                     episode_paths=tuple(episodes),
+                    source_path=str(folder),
+                    status="discovering",
+                    source_status="available",
+                    file_count=len(episodes),
+                    episode_count=len(episodes),
                 )
             )
 
@@ -431,6 +445,11 @@ class HomeCatalogService:
                             play_path=videos[0],
                             content_key=content_key,
                             classification_reason="movie-folder-heuristic",
+                            source_path=str(root),
+                            status="discovering",
+                            source_status="available",
+                            file_count=len(videos),
+                            episode_count=0,
                         )
                     )
                     continue
@@ -459,6 +478,11 @@ class HomeCatalogService:
                             play_path=child,
                             content_key=content_key,
                             classification_reason="single-file-movie-heuristic",
+                            source_path=str(root),
+                            status="discovering",
+                            source_status="available",
+                            file_count=1,
+                            episode_count=0,
                         )
                     )
 
@@ -466,6 +490,7 @@ class HomeCatalogService:
 
     def _enrich_group(self, sg: ShowGroup) -> ShowGroup:
         self._raise_if_cancelled()
+        now = int(time.time())
         base_key = str(getattr(sg, "content_key", "") or "").strip()
         if not base_key:
             base_key = self._canonical_path_key(getattr(sg, "primary_dir", Path("")))
@@ -549,8 +574,12 @@ class HomeCatalogService:
         elif not reason:
             reason = "heuristic"
 
+        warnings = list(dict.fromkeys([*(getattr(sg, "warnings", ()) or ())]))
         if not bool(metadata.get("metadata_found")) and media_hint != md_type:
-            self._warnings.append(f"[CATALOG][AMBIGUOUS] {base_key} -> guessed '{md_type}'")
+            warning = f"[CATALOG][AMBIGUOUS] {base_key} -> guessed '{md_type}'"
+            self._warnings.append(warning)
+            if warning not in warnings:
+                warnings.append(warning)
 
         return ShowGroup(
             display_title=md_title,
@@ -569,6 +598,40 @@ class HomeCatalogService:
             tmdb_media_type=str(metadata.get("tmdb_media_type") or ""),
             backdrop_path=backdrop,
             classification_reason=reason,
+            episode_paths=tuple(getattr(sg, "episode_paths", ()) or ()),
+            title_id=str(getattr(sg, "title_id", "") or ""),
+            status="ready" if bool(metadata.get("metadata_found")) and bool(poster or backdrop) else ("partial" if bool(metadata.get("metadata_found")) else "metadata_pending"),
+            source_path=str(getattr(sg, "source_path", "") or getattr(sg, "primary_dir", Path(""))),
+            source_status=str(getattr(sg, "source_status", "") or "available"),
+            source_enabled=bool(getattr(sg, "source_enabled", True)),
+            created_at=int(getattr(sg, "created_at", 0) or 0),
+            updated_at=now,
+            last_scanned_at=now,
+            metadata_updated_at=now if bool(metadata.get("metadata_found")) else int(getattr(sg, "metadata_updated_at", 0) or 0),
+            art_updated_at=now if bool(poster or backdrop) else int(getattr(sg, "art_updated_at", 0) or 0),
+            warnings=tuple(dict.fromkeys(warnings)),
+            errors=tuple(getattr(sg, "errors", ()) or ()),
+            duplicate_paths=tuple(getattr(sg, "duplicate_paths", ()) or ()),
+            duplicate_of=str(getattr(sg, "duplicate_of", "") or ""),
+            metadata_source="tmdb" if bool(metadata.get("metadata_found")) else "",
+            art_source="local" if bool(poster or backdrop) else "",
+            file_count=int(getattr(sg, "file_count", 0) or len(list(getattr(sg, "all_dirs", []) or [])) or 0),
+            episode_count=int(getattr(sg, "episode_count", 0) or len(tuple(getattr(sg, "episode_paths", ()) or ())) or 0),
+        )
+
+    def _mark_failed_group(self, sg: ShowGroup, exc: Exception) -> ShowGroup:
+        message = f"{type(exc).__name__}: {exc}"
+        warnings = list(getattr(sg, "warnings", ()) or ())
+        errors = list(getattr(sg, "errors", ()) or ())
+        if message not in errors:
+            errors.append(message)
+        return replace(
+            sg,
+            status="failed",
+            warnings=tuple(dict.fromkeys(warnings)),
+            errors=tuple(dict.fromkeys(errors)),
+            updated_at=int(time.time()),
+            last_scanned_at=int(time.time()),
         )
 
     def _fetch_metadata(self, query: str, *, media_hint: str, year_hint: Optional[int], allow_network: bool) -> Optional[Dict[str, object]]:

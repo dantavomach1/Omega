@@ -22,7 +22,7 @@ from typing import Any, Callable, Dict, Optional, List, Tuple, Type, Iterator, S
 from collections import defaultdict, deque
 from difflib import SequenceMatcher
 
-from PySide6.QtCore import QObject, Qt, QRect, QRectF, QTimer, QEvent, QPoint, QUrl, QSize, QByteArray, Signal, QEasingCurve, QPropertyAnimation
+from PySide6.QtCore import QObject, Qt, QRect, QRectF, QTimer, QEvent, QPoint, QUrl, QSize, QByteArray, Signal, QEasingCurve, QPropertyAnimation, QThreadPool
 from PySide6.QtGui import QFont, QCursor, QWheelEvent, QAction, QColor, QPixmap, QPainter, QPainterPath, QPen, QLinearGradient, QRegion, QFontMetrics, QKeySequence, QShortcut, QFontDatabase
 from PySide6.QtWidgets import (
     QMainWindow,
@@ -169,6 +169,7 @@ from omega.library.tmdb_client import TMDBClient, TMDBHit
 from omega.library.metadata_cache import MetadataCache, MetadataProvider
 from omega.library.home_catalog import CatalogBuildCancelled, HomeCatalogService
 from omega.library.media_discovery import MediaDiscoveryService
+from omega.library.ingestion_worker import CatalogRefreshRequest, CatalogRefreshTask, SourceDiscoveryRequest, SourceDiscoveryTask
 from omega.library.metadata_provider_base import DisabledMetadataProvider
 from omega.player.mpv_backend import MPVBackend
 from omega.player.skip_segments import SegmentSkipStore, SkipSegment, TUNING as SEGMENT_SKIP_TUNING
@@ -418,6 +419,13 @@ class HomeLayoutTuning:
 
     rail_pad_min_px: int = 20
     rail_pad_max_px: int = 40
+
+
+@dataclass(frozen=True)
+class LibraryIngestionTuning:
+    max_workers: int = max(1, min(8, os.cpu_count() or 4))
+    refresh_timeout_ms: int = 45000
+    startup_wait_ms: int = 8600
     rail_pad_ratio_of_card_h: float = 0.15
 
     hero_space_ratio_of_viewport_h: float = 0.30
@@ -1073,6 +1081,7 @@ class PlayerController(QObject):
         dprint("[PATH] shows_dir:", self._shows_dir)
 
         self._library_file = self._media_dir / "library.json"
+        dprint(f"[LIBRARY][STARTUP] loading={self._library_file}")
         self._library = LibraryManager()
         self._library.ensure_default_source()
         self._scanner = LibraryScanner(video_exts=self.VIDEO_EXTS)
@@ -1080,6 +1089,15 @@ class PlayerController(QObject):
         msg = migrate_sources_txt_to_library_json(self._media_dir / "sources.txt", self._library_file)
         if msg:
             dprint("[LIBRARY][MIGRATE]", msg)
+            try:
+                self._library.load_or_init()
+                self._library.save()
+                try:
+                    self._library._write_sources_json([str(src.path) for src in self._library.list_sources(enabled_only=False)])
+                except Exception:
+                    pass
+            except Exception as e:
+                dprint(f"[LIBRARY][LOAD][WARN] migration reload failed: {type(e).__name__}: {e}")
 
         self._meta_cache = MetadataCache(self._meta_cache_file)
         self._meta_provider = MetadataProvider()
@@ -1197,6 +1215,17 @@ class PlayerController(QObject):
         # Cache the last viewport size we reacted to. Prevents resize/rebuild feedback loops.
         self._home_last_viewport_size = (-1, -1)
         self._home_runtime = HomeRuntimeCoordinator()
+        self._library_ingestion_tuning = LibraryIngestionTuning()
+        self._library_ingest_pool = QThreadPool(self)
+        try:
+            self._library_ingest_pool.setMaxThreadCount(int(self._library_ingestion_tuning.max_workers))
+            self._library_ingest_pool.setExpiryTimeout(30000)
+        except Exception:
+            pass
+        self._home_catalog_timeout_timer = QTimer(self)
+        self._home_catalog_timeout_timer.setSingleShot(True)
+        self._home_catalog_timeout_timer.setInterval(int(self._library_ingestion_tuning.refresh_timeout_ms))
+        self._home_catalog_timeout_timer.timeout.connect(self._home_catalog_refresh_timed_out)
         self._home_splitters_collapsed = False
 
         self._home_selected_shows: Dict[str, SelectedShowItem] = {}
@@ -1255,6 +1284,8 @@ class PlayerController(QObject):
         self._home_catalog_active_max_network_lookups = 24
         self._home_catalog_refresh_seq = 0
         self._home_catalog_active_refresh_id = 0
+        self._home_catalog_active_batch_id = ""
+        self._home_catalog_active_task = None
         self._home_catalog_cancel_event: Optional[threading.Event] = None
         self._home_catalog_result_poll_pending = False
         self._home_catalog_result_timer = QTimer(self)
@@ -1275,6 +1306,14 @@ class PlayerController(QObject):
         self._home_state: Dict[str, Any] = self._home_state_load()
         self._home_state_revision = 1
         self._home_state_last_save_ts = 0
+        self._home_catalog_last_error = ""
+        self._home_catalog_last_error_reason = ""
+        self._home_catalog_last_error_ts = 0.0
+        self._home_catalog_last_commit_summary: Dict[str, Any] = {}
+        try:
+            self._home_bootstrap_committed_catalog(source="startup-committed", queue_refresh=True)
+        except Exception as e:
+            dprint("[LIBRARY][LOAD][WARN] startup catalog bootstrap failed:", e)
         self._saved_mix_active_id = ""
         self._saved_mix_active_mode_label = ""
         self._saved_mix_art_cache: Dict[str, QPixmap] = {}
@@ -1595,16 +1634,30 @@ class PlayerController(QObject):
         self._player_floating_mini_reset_pending = True
         self._media_discovery_service = MediaDiscoveryService(DisabledMetadataProvider())
         self._sources_candidates: List[Any] = []
+        self._sources_refresh_active_id = 0
+        self._sources_refresh_inflight = False
+        self._sources_refresh_active_task = None
+        self._sources_refresh_last_error = ""
         self._sources_candidate_list: Optional[QListWidget] = None
         self._sources_table: Optional[QTableWidget] = None
         self._sources_status_label: Optional[QLabel] = None
         self._media_editor_fields: Dict[str, QLineEdit] = {}
         self._fonts_family_combo: Optional[QComboBox] = None
         self._fonts_scale_slider: Optional[QSlider] = None
+        self._fonts_weight_combo: Optional[QComboBox] = None
+        self._fonts_density_combo: Optional[QComboBox] = None
+        self._fonts_token_label: Optional[QLabel] = None
+        self._fonts_preview_widgets: List[QWidget] = []
         self._intro_animation_combo: Optional[QComboBox] = None
         self._intro_animation_enabled_check: Optional[QCheckBox] = None
+        self._intro_animation_duration_combo: Optional[QComboBox] = None
+        self._intro_animation_play_once_check: Optional[QCheckBox] = None
         self._home_intro_effect: Optional[QGraphicsOpacityEffect] = None
         self._home_intro_anim: Optional[QPropertyAnimation] = None
+        self._home_intro_played_this_launch = False
+        self._search_intro_tab: Optional[QWidget] = None
+        self._theme_gallery_cards: Dict[str, QWidget] = {}
+        self._theme_gallery_filter: Optional[QLineEdit] = None
 
         # Watch Home scroll viewport for resize events
         try:
@@ -1664,15 +1717,16 @@ class PlayerController(QObject):
     # ============================================================
 
     def _shell_wire_navigation(self) -> None:
-        # Keep the legacy dock buttons coherent even though the sidebar is now primary.
+        # Keep the legacy dock buttons coherent with the simplified main navigation.
         self.navHomeBtn.setText("Home")
-        self.navSearchBtn.setText("Library")
-        self.navPlayerBtn.setText("Now Playing")
+        self.navSearchBtn.setText("Player")
+        self.navPlayerBtn.setText("Settings")
 
         self.navHomeBtn.clicked.connect(self._nav_go_home)
-        self.navSearchBtn.clicked.connect(self._nav_go_library)
-        self.navPlayerBtn.clicked.connect(self._nav_go_player)
+        self.navSearchBtn.clicked.connect(self._nav_go_player)
+        self.navPlayerBtn.clicked.connect(self._nav_go_settings)
         self.navHomeBtn.setChecked(True)
+
     def _on_page_changed(self, _idx: int) -> None:
         self._bg_trace("page-changed", f"idx={_idx}")
         try:
@@ -1692,17 +1746,15 @@ class PlayerController(QObject):
             if bool(getattr(self, "_player_session_active", False)):
                 self._player_flush_progress_snapshot()
         elif cur is self.searchPage:
-            active_top = str(getattr(self, "_active_top_nav", "library") or "library")
-            if active_top not in {"library", "settings"}:
-                active_top = "library"
-                self._active_top_nav = active_top
-            self._nav_set_bottom_checked("library")
+            active_top = "settings"
+            self._active_top_nav = active_top
+            self._nav_set_bottom_checked("settings")
             self._nav_mark_top_active(active_top)
             if bool(getattr(self, "_search_refresh_deferred", False)):
                 self._search_refresh_deferred = False
                 QTimer.singleShot(0, self._search_request_refresh)
         else:
-            self._nav_set_bottom_checked("none")
+            self._nav_set_bottom_checked("player")
             self._nav_mark_top_active("player")
 
         if cur is not self.searchPage:
@@ -2131,11 +2183,13 @@ class PlayerController(QObject):
         cancel_event = getattr(self, "_home_catalog_cancel_event", None)
         self._home_catalog_pending_result = None
         self._home_catalog_stop_result_watch()
+        self._home_catalog_timeout_timer.stop()
         if cancel_event is not None:
             try:
                 cancel_event.set()
             except Exception:
                 pass
+        self._home_catalog_active_task = None
 
     def _drain_simple_queue(self, q: Any, *, limit: int = 256) -> int:
         drained = 0
@@ -2808,9 +2862,9 @@ class PlayerController(QObject):
         target: Optional[QPushButton] = None
         if mode == "home":
             target = self.navHomeBtn
-        elif mode == "library":
-            target = self.navSearchBtn
         elif mode == "player":
+            target = self.navSearchBtn
+        elif mode in {"library", "settings"}:
             target = self.navPlayerBtn
 
         for btn in (self.navHomeBtn, self.navSearchBtn, self.navPlayerBtn):
@@ -2871,12 +2925,14 @@ class PlayerController(QObject):
             try:
                 tab_map = {
                     "discover": getattr(self, "_search_sources_tab", None) or getattr(self, "_search_library_tab", None),
-                    "library": getattr(self, "_search_media_library_tab", None) or getattr(self, "_search_library_tab", None),
+                    "library": getattr(self, "_search_library_tab", None),
                     "media": getattr(self, "_search_media_library_tab", None),
                     "sources": getattr(self, "_search_sources_tab", None),
                     "themes": getattr(self, "_search_themes_tab", None),
                     "fonts": getattr(self, "_search_fonts_tab", None),
                     "layout": getattr(self, "_search_layout_tab", None),
+                    "intro": getattr(self, "_search_intro_tab", None),
+                    "animations": getattr(self, "_search_intro_tab", None),
                     "settings": getattr(self, "_search_personalize_tab", None),
                 }
                 target_tab = tab_map.get(str(search_tab))
@@ -2897,7 +2953,7 @@ class PlayerController(QObject):
 
     def _nav_go_discover(self) -> None:
         self._viewer_reset_search_filters_if_needed()
-        self._nav_set_page(self.searchPage, top_key="library", search_tab="library")
+        self._nav_set_page(self.searchPage, top_key="settings", search_tab="library")
         if self._search_status_filter is not None:
             idx = self._search_status_filter.findText("Unresolved")
             if idx >= 0:
@@ -2906,7 +2962,7 @@ class PlayerController(QObject):
 
     def _nav_go_library(self) -> None:
         self._viewer_reset_search_filters_if_needed()
-        self._nav_set_page(self.searchPage, top_key="library", search_tab="media")
+        self._nav_set_page(self.searchPage, top_key="settings", search_tab="media")
         if self._search_status_filter is not None:
             idx = self._search_status_filter.findText("All")
             if idx >= 0:
@@ -2914,26 +2970,26 @@ class PlayerController(QObject):
         self._library_refresh_hq(force=True)
 
     def _nav_go_sources(self) -> None:
-        self._nav_set_page(self.searchPage, top_key="sources", search_tab="sources")
+        self._nav_set_page(self.searchPage, top_key="settings", search_tab="sources")
         self._sources_refresh_page()
 
     def _nav_go_themes(self) -> None:
-        self._nav_set_page(self.searchPage, top_key="themes", search_tab="themes")
+        self._nav_set_page(self.searchPage, top_key="settings", search_tab="themes")
 
     def _nav_go_fonts(self) -> None:
-        self._nav_set_page(self.searchPage, top_key="fonts", search_tab="fonts")
+        self._nav_set_page(self.searchPage, top_key="settings", search_tab="fonts")
 
     def _nav_go_layout(self) -> None:
-        self._nav_set_page(self.searchPage, top_key="layout", search_tab="layout")
+        self._nav_set_page(self.searchPage, top_key="settings", search_tab="layout")
 
     def _nav_go_movies(self) -> None:
-        self._nav_set_page(self.homePage, top_key="movies", home_mode="movies")
+        self._nav_set_page(self.homePage, top_key="home", home_mode="movies")
 
     def _nav_go_tv(self) -> None:
-        self._nav_set_page(self.homePage, top_key="tv", home_mode="tv")
+        self._nav_set_page(self.homePage, top_key="home", home_mode="tv")
 
     def _nav_go_my_list(self) -> None:
-        self._nav_set_page(self.homePage, top_key="mylist", home_mode="favorites")
+        self._nav_set_page(self.homePage, top_key="home", home_mode="favorites")
 
     def _nav_go_settings(self) -> None:
         self._nav_set_page(self.searchPage, top_key="settings", search_tab="settings")
@@ -3013,12 +3069,6 @@ class PlayerController(QObject):
 
         defs = [
             ("home", "Home", self._nav_go_home),
-            ("library", "Media", self._nav_go_library),
-            ("sources", "Sources", self._nav_go_sources),
-            ("mylist", "My List", self._nav_go_my_list),
-            ("themes", "Themes", self._nav_go_themes),
-            ("fonts", "Fonts", self._nav_go_fonts),
-            ("layout", "Layout", self._nav_go_layout),
             ("player", "Player", self._nav_go_player),
             ("settings", "Settings", self._nav_go_settings),
         ]
@@ -3059,12 +3109,6 @@ class PlayerController(QObject):
         navigate = menu_bar.addMenu("Navigate")
         for label, fn in [
             ("Home", self._nav_go_home),
-            ("Media Library", self._nav_go_library),
-            ("Sources", self._nav_go_sources),
-            ("Themes", self._nav_go_themes),
-            ("Fonts / Typography", self._nav_go_fonts),
-            ("Layout", self._nav_go_layout),
-            ("My List", self._nav_go_my_list),
             ("Now Playing", self._nav_go_player),
             ("Settings", self._nav_go_settings),
         ]:
@@ -3084,6 +3128,16 @@ class PlayerController(QObject):
         browse.addAction(act_search)
 
         studio = menu_bar.addMenu("Studio")
+        for label, fn in [
+            ("Library Tab", self._nav_go_library),
+            ("Sources Tab", self._nav_go_sources),
+            ("Themes Tab", self._nav_go_themes),
+            ("Fonts Tab", self._nav_go_fonts),
+            ("Layout Tab", self._nav_go_layout),
+        ]:
+            action = QAction(label, self.win)
+            action.triggered.connect(fn)
+            studio.addAction(action)
         act_profiles = QAction("Profiles", self.win)
         act_profiles.triggered.connect(self._viewer_show_startup_gate)
         studio.addAction(act_profiles)
@@ -8301,6 +8355,7 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
                         show_dirs=[Path(str(p)) for p in show_dirs],
                         poster_path=poster_path,
                         backdrop_path=backdrop_path,
+                        title_id=str(getattr(sg, "title_id", "") or select_key),
                     )
                 )
             self._home_apply_show_card_selection_state(select_key)
@@ -12020,6 +12075,235 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         if changed:
             self._home_state_save()
 
+    def _home_bootstrap_committed_catalog(self, *, source: str, queue_refresh: bool = True) -> int:
+        try:
+            committed = list(self._library.load_title_groups())
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            self._home_catalog_last_error = msg
+            self._home_catalog_last_error_reason = str(source or "")
+            self._home_catalog_last_error_ts = float(time.time())
+            dprint(f"[LIBRARY][LOAD][ERROR] source={source} error={msg}")
+            return 0
+
+        if not committed:
+            dprint(f"[LIBRARY][LOAD] source={source} titles=0")
+            if queue_refresh:
+                self._home_catalog_needs_refresh = True
+            return 0
+
+        self._home_catalog_index_items(committed, [], source=source)
+        if queue_refresh:
+            self._home_catalog_needs_refresh = True
+        self._home_catalog_last_error = ""
+        self._home_catalog_last_error_reason = ""
+        self._home_catalog_last_error_ts = 0.0
+        dprint(f"[LIBRARY][LOAD] source={source} titles={len(committed)}")
+        return len(committed)
+
+    def _home_commit_catalog_snapshot(
+        self,
+        items: Sequence[ShowGroup],
+        *,
+        source: str,
+        batch_id: str,
+        worker_count: int,
+    ) -> Optional[Any]:
+        try:
+            summary = self._library.commit_title_groups(
+                list(items or []),
+                source_label=str(source or ""),
+                batch_id=str(batch_id or ""),
+                worker_count=int(worker_count),
+            )
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            self._home_catalog_last_error = msg
+            self._home_catalog_last_error_reason = str(source or "")
+            self._home_catalog_last_error_ts = float(time.time())
+            try:
+                self._library.record_ingestion_finish(batch_id=str(batch_id or ""), error=msg)
+            except Exception:
+                pass
+            dprint(
+                f"[LIBRARY][SAVE][ERROR] batch_id={batch_id} source={source} workers={int(worker_count)} error={msg}"
+            )
+            return None
+
+        try:
+            committed = list(self._library.load_title_groups())
+        except Exception:
+            committed = list(items or [])
+
+        self._home_catalog_last_commit_summary = dict(getattr(summary, "__dict__", {}) or {})
+        self._home_catalog_last_error = ""
+        self._home_catalog_last_error_reason = ""
+        self._home_catalog_last_error_ts = 0.0
+        dprint(
+            "[INGEST][BATCH] "
+            f"id={getattr(summary, 'batch_id', batch_id)} "
+            f"source={getattr(summary, 'source_label', source)} "
+            f"candidates={getattr(summary, 'candidate_count', len(list(items or [])))} "
+            f"imported={getattr(summary, 'imported_count', 0)} "
+            f"updated={getattr(summary, 'updated_count', 0)} "
+            f"duplicates={getattr(summary, 'skipped_duplicate_count', 0)} "
+            f"failed={getattr(summary, 'failed_count', 0)} "
+            f"elapsed={float(getattr(summary, 'elapsed_s', 0.0) or 0.0):.2f}s "
+            f"workers={getattr(summary, 'worker_count', int(worker_count))}"
+        )
+        self._home_catalog_index_items(committed, [], source=f"committed:{source}")
+        return summary
+
+    def _home_clear_layout_widgets(self) -> None:
+        layout = self._home_layout
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            if item is None:
+                continue
+            widget = item.widget()
+            if widget is not None:
+                try:
+                    widget.setParent(None)
+                    widget.deleteLater()
+                except Exception:
+                    pass
+
+    def _home_show_degraded_status(self, heading: str, detail: str = "", *, action_text: str = "Open Settings") -> None:
+        if self._home_layout is None:
+            return
+
+        self._home_clear_layout_widgets()
+
+        frame = QFrame(self.homeContent)
+        frame.setObjectName("homeDegradedStatusCard")
+        frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        frame_l = QVBoxLayout(frame)
+        frame_l.setContentsMargins(22, 18, 22, 18)
+        frame_l.setSpacing(10)
+
+        title = QLabel(str(heading or "Home needs attention."), frame)
+        title.setObjectName("studioTitle")
+        title.setWordWrap(True)
+        body = QLabel(str(detail or "The library is still usable, but this view could not finish updating."), frame)
+        body.setObjectName("studioGroupLead")
+        body.setWordWrap(True)
+        action_row = QHBoxLayout()
+        action_btn = QPushButton(str(action_text or "Open Settings"), frame)
+        action_btn.clicked.connect(self._nav_go_settings)
+        action_row.addWidget(action_btn)
+        action_row.addStretch(1)
+
+        frame_l.addWidget(title)
+        frame_l.addWidget(body)
+        frame_l.addLayout(action_row)
+
+        self._home_layout.addStretch(1)
+        self._home_layout.addWidget(frame)
+        self._home_layout.addStretch(1)
+
+    def _library_health_snapshot(self) -> Dict[str, Any]:
+        try:
+            report = self._library.health_check()
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            dprint(f"[LIBRARY][LOAD][WARN] health check failed: {msg}")
+            return {
+                "ok": False,
+                "total_sources": 0,
+                "available_sources": 0,
+                "unavailable_sources": 0,
+                "total_titles": len(list(getattr(self, "_home_catalog_items", []) or [])),
+                "ready_titles": 0,
+                "partial_titles": 0,
+                "failed_titles": 0,
+                "missing_metadata": 0,
+                "missing_art": 0,
+                "quarantined_count": 0,
+                "active_ingestion_status": "error",
+                "active_batch_id": "",
+                "last_scan_at": 0,
+                "last_successful_commit_at": 0,
+                "latest_errors": (msg,),
+                "notes": (),
+            }
+
+        return {
+            "ok": bool(getattr(report, "ok", False)),
+            "total_sources": int(getattr(report, "total_sources", 0) or 0),
+            "available_sources": int(getattr(report, "available_sources", 0) or 0),
+            "unavailable_sources": int(getattr(report, "unavailable_sources", 0) or 0),
+            "total_titles": int(getattr(report, "total_titles", 0) or 0),
+            "ready_titles": int(getattr(report, "ready_titles", 0) or 0),
+            "partial_titles": int(getattr(report, "partial_titles", 0) or 0),
+            "failed_titles": int(getattr(report, "failed_titles", 0) or 0),
+            "missing_metadata": int(getattr(report, "missing_metadata", 0) or 0),
+            "missing_art": int(getattr(report, "missing_art", 0) or 0),
+            "quarantined_count": int(getattr(report, "quarantined_count", 0) or 0),
+            "active_ingestion_status": str(getattr(report, "active_ingestion_status", "idle") or "idle"),
+            "active_batch_id": str(getattr(report, "active_batch_id", "") or ""),
+            "last_scan_at": int(getattr(report, "last_scan_at", 0) or 0),
+            "last_successful_commit_at": int(getattr(report, "last_successful_commit_at", 0) or 0),
+            "latest_errors": tuple(str(x) for x in (getattr(report, "latest_errors", ()) or ()) if str(x).strip()),
+            "notes": tuple(str(x) for x in (getattr(report, "notes", ()) or ()) if str(x).strip()),
+        }
+
+    def _library_rebuild_home_from_committed_catalog(self, *, reason: str = "manual-rebuild") -> None:
+        dprint(f"[HOME][REBUILD] reason={reason}")
+        loaded = self._home_bootstrap_committed_catalog(source=str(reason or "manual-rebuild"), queue_refresh=False)
+        if loaded <= 0:
+            self._home_catalog_needs_refresh = True
+            self._home_request_build()
+            self._library_refresh_hq(force=True)
+            self._settings_refresh_overview(force=True)
+            return
+        self._home_catalog_needs_refresh = False
+        self._home_request_build()
+        self._library_refresh_hq(force=True)
+        self._settings_refresh_overview(force=True)
+
+    def _library_run_health_check(self) -> None:
+        snapshot = self._library_health_snapshot()
+        latest = str((snapshot.get("latest_errors") or ("",))[0] if snapshot.get("latest_errors") else "").strip()
+        dprint(
+            "[LIBRARY][LOAD] health "
+            f"ok={snapshot.get('ok')} sources={snapshot.get('available_sources')}/{snapshot.get('total_sources')} "
+            f"titles={snapshot.get('total_titles')} ready={snapshot.get('ready_titles')} "
+            f"partial={snapshot.get('partial_titles')} failed={snapshot.get('failed_titles')} "
+            f"missing_md={snapshot.get('missing_metadata')} missing_art={snapshot.get('missing_art')} "
+            f"active={snapshot.get('active_ingestion_status')} batch={snapshot.get('active_batch_id')}"
+        )
+        if latest:
+            dprint(f"[LIBRARY][ERROR] latest={latest}")
+        self._library_refresh_hq(force=True)
+        self._settings_refresh_overview(force=True)
+
+    def _library_repair_index(self) -> None:
+        try:
+            report, changed = self._library.repair_index()
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            dprint(f"[LIBRARY][RECOVER][ERROR] repair failed: {msg}")
+            self._home_catalog_last_error = msg
+            self._home_catalog_last_error_reason = "repair-index"
+            self._home_catalog_last_error_ts = float(time.time())
+            self._home_show_degraded_status(
+                "Library repair failed.",
+                f"{msg} The current committed library is still available, but the repair pass could not complete.",
+                action_text="Open Settings",
+            )
+            return
+
+        dprint(
+            f"[LIBRARY][RECOVER] repair changed={changed} ok={report.ok} "
+            f"titles={report.total_titles} sources={report.available_sources}/{report.total_sources}"
+        )
+        self._home_bootstrap_committed_catalog(source="repair-index", queue_refresh=False)
+        self._library_refresh_hq(force=True)
+        self._settings_refresh_overview(force=True)
+        self._home_request_build()
+
     def _home_state_toggle_favorite(self, content_key: str) -> bool:
         key = str(content_key or "").strip()
         fav = self._home_state.setdefault("favorites", [])
@@ -12710,8 +12994,17 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             self._home_catalog_start_result_watch()
             return
 
+        if not self._home_catalog_items:
+            try:
+                self._home_bootstrap_committed_catalog(source="refresh-seed", queue_refresh=False)
+            except Exception:
+                pass
+
         self._home_catalog_refresh_inflight = True
         self._home_catalog_last_refresh_started = float(time.time())
+        self._home_catalog_last_error = ""
+        self._home_catalog_last_error_reason = ""
+        self._home_catalog_last_error_ts = 0.0
         self._home_catalog_pending_result = None
         self._home_catalog_active_reason = str(reason)
         self._home_catalog_active_allow_network = bool(allow_network)
@@ -12719,52 +13012,114 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         self._home_catalog_refresh_seq = int(getattr(self, "_home_catalog_refresh_seq", 0) or 0) + 1
         refresh_id = int(self._home_catalog_refresh_seq)
         self._home_catalog_active_refresh_id = refresh_id
+        batch_id = f"home-{refresh_id}"
+        self._home_catalog_active_batch_id = batch_id
         cancel_event = threading.Event()
         self._home_catalog_cancel_event = cancel_event
         self._home_catalog_start_result_watch()
+        self._home_catalog_timeout_timer.start()
+        worker_count = int(getattr(self._library_ingestion_tuning, "max_workers", 1) or 1)
+        seed_groups = list(self._home_catalog_items or [])
+        sources = [Path(str(s.path)) for s in self._library.list_sources(enabled_only=True)]
+        request = CatalogRefreshRequest(
+            refresh_id=refresh_id,
+            reason=str(reason),
+            allow_network=bool(allow_network),
+            max_network_lookups=int(max_network_lookups),
+            cache_dir=self._cache_dir,
+            video_exts=tuple(sorted(self.VIDEO_EXTS)),
+            image_exts=tuple(sorted(self.IMAGE_EXTS)),
+            seed_groups=tuple(seed_groups),
+            sources=tuple(sources),
+            movies_dir=(self._media_dir / "Movies"),
+            loose_episode_roots=tuple([self._shows_dir, *sources]),
+            worker_count=worker_count,
+        )
+        task = CatalogRefreshTask(request, cancel_event)
+        self._home_catalog_active_task = task
+        try:
+            task.signals.finished.connect(self._home_catalog_worker_finished)
+        except Exception:
+            pass
+        try:
+            self._library.record_ingestion_start(
+                batch_id=batch_id,
+                source_label=str(reason),
+                worker_count=worker_count,
+                candidate_count=len(seed_groups),
+            )
+        except Exception as e:
+            dprint(f"[LIBRARY][LOAD][WARN] ingestion start record failed: {e}")
         dprint(
-            f"[HOME][CATALOG] Async refresh start reason={reason} "
+            f"[INGEST][DISCOVER] batch_id={batch_id} reason={reason} "
+            f"seed_titles={len(seed_groups)} sources={len(sources)} workers={worker_count} "
             f"allow_network={allow_network} max_network_lookups={int(max_network_lookups)}"
         )
-
-        def worker() -> None:
-            t0 = float(time.time())
-            payload: Dict[str, Any] = {
-                "refresh_id": int(refresh_id),
-                "reason": str(reason),
-                "items": [],
-                "warnings": [],
-                "error": "",
-                "elapsed_s": 0.0,
-                "cancelled": False,
-            }
-
+        try:
+            self._library_ingest_pool.start(task)
+        except Exception as e:
+            self._home_catalog_active_task = None
+            self._home_catalog_refresh_inflight = False
+            self._home_catalog_cancel_event = None
+            self._home_catalog_timeout_timer.stop()
+            self._home_catalog_last_error = f"{type(e).__name__}: {e}"
+            self._home_catalog_last_error_reason = str(reason)
+            self._home_catalog_last_error_ts = float(time.time())
             try:
-                tv_seed = self._home_list_shows_merged()
-                sources = [Path(str(s.path)) for s in self._library.list_sources(enabled_only=True)]
-                result = self._home_catalog.build(
-                    tv_seed,
-                    sources=sources,
-                    movies_dir=(self._media_dir / "Movies"),
-                    loose_episode_roots=[self._shows_dir, *sources],
-                    allow_network=bool(allow_network),
-                    max_network_lookups=max(0, int(max_network_lookups)),
-                    should_cancel=lambda: bool(cancel_event.is_set()) or self._player_should_reduce_background_work(),
-                )
-                payload["items"] = list(result.all_items)
-                payload["warnings"] = list(result.warnings)
-            except CatalogBuildCancelled:
-                payload["cancelled"] = True
-            except Exception as e:
-                payload["error"] = f"{type(e).__name__}: {e}"
+                self._library.record_ingestion_finish(batch_id=batch_id, error=self._home_catalog_last_error)
+            except Exception:
+                pass
+            dprint(f"[INGEST][ERROR] batch_id={batch_id} reason={reason} error={self._home_catalog_last_error}")
+            self._home_catalog_needs_refresh = True
+            self._player_maybe_run_deferred_catalog_refresh()
+            return
 
-            payload["elapsed_s"] = float(time.time()) - t0
-            if int(refresh_id) != int(getattr(self, "_home_catalog_active_refresh_id", 0) or 0):
-                return
-            self._home_catalog_pending_result = payload
-            self._home_notify_catalog_result_ready()
+    def _home_catalog_worker_finished(self, payload: Dict[str, Any]) -> None:
+        refresh_id = int(payload.get("refresh_id") or 0)
+        active_id = int(getattr(self, "_home_catalog_active_refresh_id", 0) or 0)
+        if refresh_id and refresh_id != active_id:
+            dprint(f"[HOME][CATALOG] Ignored stale worker result refresh_id={refresh_id} active={active_id}")
+            return
+        self._home_catalog_pending_result = dict(payload)
+        self._home_notify_catalog_result_ready()
 
-        threading.Thread(target=worker, daemon=True).start()
+    def _home_catalog_refresh_timed_out(self) -> None:
+        if not bool(getattr(self, "_home_catalog_refresh_inflight", False)):
+            return
+
+        started_at = float(getattr(self, "_home_catalog_last_refresh_started", 0.0) or 0.0)
+        elapsed = max(0.0, float(time.time()) - started_at) if started_at > 0.0 else 0.0
+        batch_id = str(getattr(self, "_home_catalog_active_batch_id", "") or "")
+        reason = str(getattr(self, "_home_catalog_active_reason", "") or "refresh-timeout")
+        err = f"Timed out after {elapsed:.1f}s while updating Home."
+        cancel_event = getattr(self, "_home_catalog_cancel_event", None)
+        if cancel_event is not None:
+            try:
+                cancel_event.set()
+            except Exception:
+                pass
+        self._home_catalog_refresh_inflight = False
+        self._home_catalog_needs_refresh = True
+        self._home_catalog_last_refresh_finished = float(time.time())
+        self._home_catalog_last_error = err
+        self._home_catalog_last_error_reason = reason
+        self._home_catalog_last_error_ts = float(time.time())
+        self._home_catalog_active_refresh_id = 0
+        self._home_catalog_active_reason = ""
+        self._home_catalog_active_task = None
+        self._home_catalog_cancel_event = None
+        self._home_catalog_stop_result_watch()
+        self._home_catalog_timeout_timer.stop()
+        try:
+            self._library.record_ingestion_finish(batch_id=batch_id, error=err)
+        except Exception:
+            pass
+        dprint(f"[HOME][DEGRADED] batch_id={batch_id} reason={reason} error={err}")
+        if self._home_layout is not None and self.homeContent is not None:
+            try:
+                self._home_request_build()
+            except Exception:
+                pass
 
     def _home_catalog_poll_async_result(self, *, trigger_rebuild: bool = True) -> None:
         if self._player_should_reduce_background_work():
@@ -12774,27 +13129,46 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         if payload is None:
             return
 
+        refresh_id = int(payload.get("refresh_id") or 0)
+        active_id = int(getattr(self, "_home_catalog_active_refresh_id", 0) or 0)
+        if refresh_id and refresh_id != active_id:
+            dprint(f"[HOME][CATALOG] Ignored stale polled result refresh_id={refresh_id} active={active_id}")
+            self._home_catalog_pending_result = None
+            return
+        self._home_catalog_timeout_timer.stop()
         self._home_catalog_pending_result = None
         self._home_catalog_refresh_inflight = False
         self._home_catalog_last_refresh_finished = float(time.time())
-        refresh_id = int(payload.get("refresh_id") or 0)
-        if refresh_id and refresh_id != int(getattr(self, "_home_catalog_active_refresh_id", 0) or 0):
-            return
         self._home_catalog_active_refresh_id = 0
         self._home_catalog_active_reason = ""
+        self._home_catalog_active_batch_id = ""
+        self._home_catalog_active_task = None
         self._home_catalog_cancel_event = None
         self._home_catalog_stop_result_watch()
 
         err = str(payload.get("error") or "").strip()
         elapsed = float(payload.get("elapsed_s") or 0.0)
         reason = str(payload.get("reason") or "")
+        worker_count = int(payload.get("worker_count") or getattr(self._library_ingestion_tuning, "max_workers", 1) or 1)
         if bool(payload.get("cancelled", False)):
+            self._home_catalog_last_error = ""
+            self._home_catalog_last_error_reason = reason
+            self._home_catalog_last_error_ts = float(time.time())
             self._home_catalog_needs_refresh = True
+            self._home_request_build()
             self._player_maybe_run_deferred_catalog_refresh()
             return
         if err:
             dprint(f"[HOME][CATALOG][ERROR] reason={reason} elapsed={elapsed:.2f}s error={err}")
+            self._home_catalog_last_error = err
+            self._home_catalog_last_error_reason = reason
+            self._home_catalog_last_error_ts = float(time.time())
+            try:
+                self._library.record_ingestion_finish(batch_id=f"home-{refresh_id}", error=err)
+            except Exception:
+                pass
             self._home_catalog_needs_refresh = True
+            self._home_request_build()
             self._player_maybe_run_deferred_catalog_refresh()
             return
 
@@ -12805,7 +13179,18 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         if not isinstance(warnings, list):
             warnings = []
 
-        self._home_catalog_index_items(items, [str(x) for x in warnings], source=f"async:{reason}")
+        summary = self._home_commit_catalog_snapshot(
+            list(items),
+            source=str(reason),
+            batch_id=f"home-{refresh_id}",
+            worker_count=worker_count,
+        )
+        if summary is None:
+            self._home_catalog_needs_refresh = True
+            self._home_request_build()
+            self._player_maybe_run_deferred_catalog_refresh()
+            return
+
         if isinstance(getattr(self, "_home_catalog_deferred_refresh", None), dict):
             self._home_catalog_needs_refresh = True
             dprint(f"[HOME][CATALOG] Starting queued follow-up refresh after reason={reason}")
@@ -12825,6 +13210,15 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         # Pull in any completed async result first.
         self._home_catalog_poll_async_result(trigger_rebuild=False)
 
+        if self._home_catalog_items:
+            if self._home_catalog_needs_refresh and not self._home_catalog_refresh_inflight:
+                self._home_catalog_start_async_refresh("stale-items", allow_network=False)
+            return list(self._home_catalog_items)
+
+        try:
+            self._home_bootstrap_committed_catalog(source="home-build", queue_refresh=False)
+        except Exception:
+            pass
         if self._home_catalog_items:
             if self._home_catalog_needs_refresh and not self._home_catalog_refresh_inflight:
                 self._home_catalog_start_async_refresh("stale-items", allow_network=False)
@@ -13263,6 +13657,7 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
                     overview=overview,
                     image_path=Path(str(img)) if img is not None else None,
                     poster_path=Path(str(poster_img)) if poster_img is not None else None,
+                    title_id=str(getattr(sg, "title_id", "") or key),
                     media_type=str(getattr(sg, "media_type", "") or ""),
                     eyebrow=eyebrow,
                     badges=tuple(badges[:4]),
@@ -13812,6 +14207,7 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
     def _home_build(self, precomputed_profile: Optional[dict] = None) -> None:
         t0 = float(time.time())
         dprint("[DEBUG][BUILD] Starting home_build")
+        dprint("[HOME][REBUILD] Starting home_build")
 
         if self._home_layout is None or self._show_card_template is None:
             dprint("[DEBUG][BUILD] Layout or template None - abort")
@@ -13867,10 +14263,18 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
                 w.deleteLater()
 
         if not items:
-            msg = "Loading your library..."
-            if not self._home_catalog_refresh_inflight:
-                msg = "No media found yet. Add a source from Library Maintenance."
-            self._home_show_empty_status(msg)
+            err = str(getattr(self, "_home_catalog_last_error", "") or "").strip()
+            if err and not self._home_catalog_refresh_inflight:
+                detail = (
+                    f"{err} Library data is still usable, but Home could not finish updating. "
+                    "Open Settings to run a library health check, repair the index, or rebuild Home from the committed library."
+                )
+                self._home_show_degraded_status("Home could not finish updating.", detail, action_text="Open Settings")
+            else:
+                msg = "Loading your library..."
+                if not self._home_catalog_refresh_inflight:
+                    msg = "No media found yet. Add a source from Library Maintenance."
+                self._home_show_empty_status(msg)
             self._home_last_render_signature = ("empty",) + render_sig
             dprint(
                 f"[DEBUG][BUILD] home_build completed (no items) "
@@ -14933,6 +15337,7 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             show_dirs=show_dirs,
             poster_path=Path(str(poster_raw)) if poster_raw is not None else None,
             backdrop_path=Path(str(backdrop_raw)) if backdrop_raw is not None else None,
+            title_id=str(getattr(sg, "title_id", "") or show_key),
         )
         self._shuffle_start_from_selected_items(
             [item],
@@ -15765,10 +16170,13 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         discover_scroll.setFrameShape(QFrame.NoFrame)
         discover_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         discover_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        discover_scroll.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
         lay.addWidget(discover_scroll, 1)
 
         discover_body = QWidget(discover_scroll)
         discover_body.setObjectName("searchDiscoverBody")
+        discover_body.setMaximumWidth(1320)
+        discover_body.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
         discover_scroll.setWidget(discover_body)
 
         body_lay = QVBoxLayout(discover_body)
@@ -16161,10 +16569,15 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         self._search_tabs.addTab(self._search_layout_tab, "Layout")
         self._layout_build_tabbed_page(self._search_layout_tab)
 
+        self._search_intro_tab = QWidget(self._search_tabs)
+        self._search_intro_tab.setObjectName("searchIntroAnimationsTab")
+        self._search_tabs.addTab(self._search_intro_tab, "Intro Animations")
+        self._intro_build_tab(self._search_intro_tab)
+
         self._search_personalize_tab = QWidget(self._search_tabs)
         self._search_personalize_tab.setObjectName("searchSettingsTab")
         self._search_tabs.addTab(self._search_personalize_tab, "Settings")
-        self._personalization_build_tab(self._search_personalize_tab)
+        self._settings_build_general_tab(self._search_personalize_tab)
 
         self._search_query.textChanged.connect(lambda _t: self._search_request_refresh())
         self._search_type_filter.currentIndexChanged.connect(lambda _i: self._search_request_refresh())
@@ -16200,7 +16613,13 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         self._apply_non_home_page_bottom_inset()
         QTimer.singleShot(0, self._glass_refresh_surface_backdrops)
 
-    def _make_page_scroll(self, tab: QWidget, *, margins: Tuple[int, int, int, int] = (12, 12, 12, 18)) -> Tuple[QWidget, QVBoxLayout]:
+    def _make_page_scroll(
+        self,
+        tab: QWidget,
+        *,
+        margins: Tuple[int, int, int, int] = (12, 12, 12, 18),
+        max_width: int = 1180,
+    ) -> Tuple[QWidget, QVBoxLayout]:
         root = QVBoxLayout(tab)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -16209,9 +16628,15 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
         root.addWidget(scroll, 1)
         body = QWidget(scroll)
         body.setObjectName("omegaPageBody")
+        if int(max_width or 0) > 0:
+            body.setMaximumWidth(int(max_width))
+            body.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        else:
+            body.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         scroll.setWidget(body)
         lay = QVBoxLayout(body)
         lay.setContentsMargins(*margins)
@@ -16219,7 +16644,7 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         return body, lay
 
     def _media_library_build_management_tab(self, tab: QWidget) -> None:
-        body, lay = self._make_page_scroll(tab)
+        body, lay = self._make_page_scroll(tab, max_width=1480)
         title = QLabel("Media Library", body)
         title.setObjectName("settingsPageTitle")
         lay.addWidget(title)
@@ -16367,7 +16792,7 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             self._media_library_refresh_list()
 
     def _sources_build_tab(self, tab: QWidget) -> None:
-        body, lay = self._make_page_scroll(tab)
+        body, lay = self._make_page_scroll(tab, max_width=1180)
         title = QLabel("Sources", body)
         title.setObjectName("settingsPageTitle")
         lay.addWidget(title)
@@ -16409,6 +16834,7 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             self._library.add_sources([str(p) for p in chosen])
         except Exception as e:
             dprint("[SOURCES][WARN] add source failed:", e)
+        dprint(f"[SOURCE][ADD] sources={[str(p) for p in chosen]}")
         self._home_catalog_needs_refresh = True
         self._home_catalog_start_async_refresh("sources-page-add", allow_network=True)
         self._sources_refresh_page()
@@ -16423,63 +16849,248 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             sources = list(self._library.list_sources(enabled_only=False))
         except Exception:
             sources = []
+        self._sources_render_source_table(sources)
+        candidates_widget.clear()
+        candidates_widget.addItem("Scanning source folders in the background...")
+        self._sources_refresh_active_id = int(getattr(self, "_sources_refresh_active_id", 0) or 0) + 1
+        discovery_id = int(self._sources_refresh_active_id)
+        self._sources_refresh_inflight = True
+        self._sources_refresh_last_error = ""
+        if self._sources_status_label is not None:
+            self._sources_status_label.setText(f"Scanning {len(sources)} source(s) for add candidates in the background...")
+
+        known_titles = list(self._home_catalog_items or [])
+        if not known_titles:
+            try:
+                known_titles = self._library.load_title_records()
+            except Exception:
+                known_titles = []
+
+        request = SourceDiscoveryRequest(
+            discovery_id=discovery_id,
+            reason="sources-page",
+            source_paths=tuple(Path(str(src.path)) for src in sources if str(getattr(src, "path", "") or "").strip()),
+            limit=260,
+            known_titles=tuple(known_titles),
+            worker_count=int(getattr(self._library_ingestion_tuning, "max_workers", 1) or 1),
+        )
+        task = SourceDiscoveryTask(request)
+        self._sources_refresh_active_task = task
+        try:
+            task.signals.finished.connect(self._sources_worker_finished)
+        except Exception:
+            pass
+        try:
+            self._library_ingest_pool.start(task)
+        except Exception as e:
+            self._sources_refresh_inflight = False
+            self._sources_refresh_active_task = None
+            self._sources_refresh_last_error = f"{type(e).__name__}: {e}"
+            dprint(f"[SOURCES][WARN] async discovery failed to start: {self._sources_refresh_last_error}")
+            candidates_widget.clear()
+            candidates_widget.addItem("Source discovery could not start.")
+            if self._sources_status_label is not None:
+                self._sources_status_label.setText(self._sources_refresh_last_error)
+            return
+        self._search_request_refresh()
+
+    def _sources_worker_finished(self, payload: Dict[str, Any]) -> None:
+        discovery_id = int(payload.get("discovery_id") or 0)
+        active_id = int(getattr(self, "_sources_refresh_active_id", 0) or 0)
+        if discovery_id and discovery_id != active_id:
+            dprint(f"[SOURCES] Ignored stale discovery result discovery_id={discovery_id} active={active_id}")
+            return
+
+        self._sources_refresh_inflight = False
+        self._sources_refresh_active_task = None
+        error = str(payload.get("error") or "").strip()
+        self._sources_refresh_last_error = error
+        candidates = list(payload.get("candidates") or [])
+        self._sources_candidates = candidates
+        self._sources_render_source_table(list(self._library.list_sources(enabled_only=False)))
+        self._sources_render_candidate_list(candidates)
+        if self._sources_status_label is not None:
+            elapsed = float(payload.get("elapsed_s") or 0.0)
+            worker_count = int(payload.get("worker_count") or getattr(self._library_ingestion_tuning, "max_workers", 1) or 1)
+            if error:
+                self._sources_status_label.setText(f"Source discovery finished with an error after {elapsed:.2f}s.")
+                dprint(f"[INGEST][ERROR] discovery_id={discovery_id} error={error}")
+            else:
+                self._sources_status_label.setText(
+                    f"{len(list(self._library.list_sources(enabled_only=False)))} source(s), {len(candidates)} polished add candidate(s). "
+                    f"Background discovery finished in {elapsed:.2f}s using {worker_count} workers."
+                )
+        self._search_request_refresh()
+
+    def _sources_render_source_table(self, sources: List[Any]) -> None:
+        table = getattr(self, "_sources_table", None)
+        if table is None:
+            return
         table.setRowCount(len(sources))
-        enabled_paths: List[str] = []
         for row, source in enumerate(sources):
             path = str(getattr(source, "path", "") or "")
             enabled = bool(getattr(source, "enabled", True))
-            if enabled:
-                enabled_paths.append(path)
             exists = Path(path).exists()
+            if not exists:
+                dprint(f"[SOURCE][UNAVAILABLE] path={path}")
             values = [path, "Yes" if enabled else "No", "Auto", "Online" if exists else "Missing"]
             for col, value in enumerate(values):
                 table.setItem(row, col, QTableWidgetItem(value))
-        try:
-            candidates = self._media_discovery_service.discover(enabled_paths, limit=260)
-        except Exception as e:
-            dprint("[SOURCES][WARN] discovery failed:", e)
-            candidates = []
-        self._sources_candidates = candidates
-        candidates_widget.clear()
+
+    def _sources_render_candidate_list(self, candidates: List[Any]) -> None:
+        widget = getattr(self, "_sources_candidate_list", None)
+        if widget is None:
+            return
+        widget.clear()
+        if not candidates:
+            widget.addItem("No candidates found yet.")
+            return
         for candidate in candidates:
-            quality = "Needs Review" if bool(candidate.needs_review) else "Ready"
-            count = f"{candidate.episode_count} episodes" if candidate.media_type == "show" else f"{candidate.file_count} file(s)"
-            item = QListWidgetItem(f"{candidate.title}  |  {candidate.media_type.title()}  |  {count}  |  {quality}")
-            item.setData(Qt.UserRole, candidate.candidate_id)
-            candidates_widget.addItem(item)
-        if self._sources_status_label is not None:
-            self._sources_status_label.setText(f"{len(sources)} source(s), {len(candidates)} polished add candidate(s). Refresh updates this live without restart.")
-        self._search_request_refresh()
+            quality = "Needs Review" if bool(getattr(candidate, "needs_review", False)) else "Ready"
+            count = f"{getattr(candidate, 'episode_count', 0)} episodes" if str(getattr(candidate, "media_type", "") or "").casefold() == "show" else f"{getattr(candidate, 'file_count', 0)} file(s)"
+            item = QListWidgetItem(f"{getattr(candidate, 'title', '')}  |  {str(getattr(candidate, 'media_type', '') or '').title()}  |  {count}  |  {quality}")
+            item.setData(Qt.UserRole, getattr(candidate, "candidate_id", ""))
+            widget.addItem(item)
 
     def _themes_build_focused_tab(self, tab: QWidget) -> None:
-        body, lay = self._make_page_scroll(tab)
+        body, lay = self._make_page_scroll(tab, max_width=1540)
         title = QLabel("Themes", body)
         title.setObjectName("settingsPageTitle")
         lay.addWidget(title)
+        toolbar = QHBoxLayout()
+        self._theme_gallery_filter = QLineEdit(body)
+        self._theme_gallery_filter.setPlaceholderText("Search themes")
+        self._theme_gallery_filter.textChanged.connect(lambda _text: self._themes_filter_gallery())
+        toolbar.addWidget(self._theme_gallery_filter, 1)
+        active = QLabel(f"Active: {self._personalization.get('preset', 'Aurora')}", body)
+        active.setObjectName("settingsMutedText")
+        toolbar.addWidget(active)
+        lay.addLayout(toolbar)
         grid = QGridLayout()
         grid.setHorizontalSpacing(14)
         grid.setVerticalSpacing(14)
-        for idx, name in enumerate(OMEGA_CURATED_THEME_NAMES):
-            card = QGroupBox(name, body)
-            card.setObjectName("themePreviewCard")
-            card_l = QVBoxLayout(card)
-            card_l.setContentsMargins(12, 12, 12, 12)
-            sample = ThemeMiniPreview(card)
-            try:
-                sample.setMinimumHeight(110)
-            except Exception:
-                pass
-            card_l.addWidget(sample)
-            meta = QLabel("Panel, card, button, input, and selected states share one token set.", card)
-            meta.setWordWrap(True)
-            meta.setObjectName("settingsMutedText")
-            card_l.addWidget(meta)
-            btn = QPushButton("Apply Theme", card)
-            btn.clicked.connect(lambda _checked=False, preset=name: self._themes_apply_named_preset(preset))
-            card_l.addWidget(btn)
+        self._theme_gallery_cards = {}
+        names = sorted(OMEGA_THEME_PRESETS.keys(), key=lambda value: str(value).casefold())
+        for idx, name in enumerate(names):
+            card = self._theme_create_gallery_card(body, name)
+            self._theme_gallery_cards[str(name)] = card
             grid.addWidget(card, idx // 2, idx % 2)
         lay.addLayout(grid)
         lay.addStretch(1)
+
+    def _theme_create_gallery_card(self, parent: QWidget, name: str) -> QWidget:
+        payload = OMEGA_THEME_PRESETS.get(str(name), {})
+        colors = dict((payload.get("colors", {}) if isinstance(payload, dict) else {}) or {})
+        base = dict((OMEGA_THEME_PRESETS.get("Aurora", {}).get("colors", {}) if isinstance(OMEGA_THEME_PRESETS.get("Aurora", {}), dict) else {}) or {})
+        base.update(colors)
+        c = lambda key, fallback: self._personalization_norm_hex(str(base.get(key, fallback) or fallback), fallback)
+        bg = c("background", "#05070B")
+        panel = c("surface_soft", c("background_alt", "#101927"))
+        card_bg = c("card", "#161F2D")
+        text = c("text", "#F5F8FE")
+        muted = c("muted_text", "#B5C0D2")
+        accent = c("primary", "#6E9EFF")
+        secondary = c("secondary", "#58C6B8")
+        border = c("border", "#2B3950")
+        chip = c("chip", "#132338")
+        is_active = str(self._personalization.get("preset", "") or "") == str(name)
+
+        outer = QFrame(parent)
+        outer.setObjectName("themePreviewCard")
+        outer.setMinimumHeight(270)
+        outer.setStyleSheet(
+            f"QFrame#themePreviewCard {{ background: {bg}; border: 1px solid {border}; border-radius: 18px; }}"
+            f"QLabel {{ color: {text}; background: transparent; }}"
+            f"QLabel#themeMuted {{ color: {muted}; }}"
+            f"QLineEdit {{ background: {card_bg}; color: {text}; border: 1px solid {border}; border-radius: 10px; padding: 7px 9px; }}"
+            f"QPushButton {{ background: {chip}; color: {text}; border: 1px solid {border}; border-radius: 10px; padding: 7px 10px; font-weight: 700; }}"
+            f"QPushButton#themePrimaryButton {{ background: {accent}; color: #FFFFFF; border-color: {accent}; }}"
+        )
+        lay = QVBoxLayout(outer)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(9)
+
+        header = QHBoxLayout()
+        title = QLabel(str(name), outer)
+        title.setObjectName("themeCardTitle")
+        title.setStyleSheet("font-size: 15px; font-weight: 800;")
+        header.addWidget(title, 1)
+        badge = QLabel("ACTIVE" if is_active else str(payload.get("category", "dark")).replace("_", " ").title(), outer)
+        badge.setObjectName("themeActiveBadge")
+        badge.setProperty("theme_name", str(name))
+        badge.setStyleSheet(
+            f"color: #FFFFFF; background: {accent if is_active else chip}; border: 1px solid {accent}; "
+            "border-radius: 9px; padding: 3px 7px; font-size: 10px; font-weight: 800;"
+        )
+        header.addWidget(badge)
+        lay.addLayout(header)
+
+        mini = QFrame(outer)
+        mini.setStyleSheet(f"background: {panel}; border: 1px solid {border}; border-radius: 14px;")
+        mini_l = QVBoxLayout(mini)
+        mini_l.setContentsMargins(10, 10, 10, 10)
+        mini_l.setSpacing(7)
+        nav = QLabel("Selected nav pill", mini)
+        nav.setStyleSheet(f"color: #FFFFFF; background: {accent}; border-radius: 9px; padding: 5px 8px; font-weight: 800;")
+        mini_l.addWidget(nav)
+        sample_card = QFrame(mini)
+        sample_card.setStyleSheet(f"background: {card_bg}; border: 1px solid {border}; border-radius: 12px;")
+        sc_l = QVBoxLayout(sample_card)
+        sc_l.setContentsMargins(10, 8, 10, 8)
+        sample_title = QLabel("Theme preview title", sample_card)
+        sample_title.setStyleSheet("font-weight: 800;")
+        sample_muted = QLabel("Muted metadata and card copy", sample_card)
+        sample_muted.setObjectName("themeMuted")
+        sc_l.addWidget(sample_title)
+        sc_l.addWidget(sample_muted)
+        mini_l.addWidget(sample_card)
+        inp = QLineEdit("Input surface", mini)
+        mini_l.addWidget(inp)
+        row = QHBoxLayout()
+        primary = QPushButton("Primary", mini)
+        primary.setObjectName("themePrimaryButton")
+        secondary_btn = QPushButton("Secondary", mini)
+        row.addWidget(primary)
+        row.addWidget(secondary_btn)
+        row.addStretch(1)
+        swatch = QLabel("", mini)
+        swatch.setFixedSize(28, 28)
+        swatch.setStyleSheet(f"background: {secondary}; border: 1px solid {accent}; border-radius: 8px;")
+        row.addWidget(swatch)
+        mini_l.addLayout(row)
+        lay.addWidget(mini)
+        apply_btn = QPushButton("Apply Theme", outer)
+        apply_btn.setObjectName("themePrimaryButton")
+        apply_btn.clicked.connect(lambda _checked=False, preset=name: self._themes_apply_named_preset(preset))
+        lay.addWidget(apply_btn)
+        return outer
+
+    def _themes_refresh_gallery_badges(self) -> None:
+        current = str(self._personalization.get("preset", "") or "")
+        tab = getattr(self, "_search_themes_tab", None)
+        if tab is None:
+            return
+        try:
+            labels = tab.findChildren(QLabel, "themeActiveBadge")
+        except Exception:
+            labels = []
+        for label in labels:
+            try:
+                name = str(label.property("theme_name") or "")
+                payload = OMEGA_THEME_PRESETS.get(name, {})
+                label.setText("ACTIVE" if name == current else str(payload.get("category", "dark")).replace("_", " ").title())
+            except Exception:
+                pass
+
+    def _themes_filter_gallery(self) -> None:
+        needle = str(self._theme_gallery_filter.text() if self._theme_gallery_filter is not None else "").strip().casefold()
+        for name, widget in (getattr(self, "_theme_gallery_cards", {}) or {}).items():
+            try:
+                payload = OMEGA_THEME_PRESETS.get(str(name), {})
+                hay = f"{name} {payload.get('description', '') if isinstance(payload, dict) else ''} {payload.get('category', '') if isinstance(payload, dict) else ''}".casefold()
+                widget.setVisible((not needle) or needle in hay)
+            except Exception:
+                pass
 
     def _themes_apply_named_preset(self, preset: str) -> None:
         if str(preset) not in OMEGA_THEME_PRESETS:
@@ -16488,12 +17099,19 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         self._personalization_save()
         self._personalization_apply_current_theme()
         self._personalization_sync_inputs_from_config()
+        self._themes_refresh_gallery_badges()
 
     def _fonts_build_tab(self, tab: QWidget) -> None:
-        body, lay = self._make_page_scroll(tab)
-        title = QLabel("Fonts / Typography", body)
+        body, lay = self._make_page_scroll(tab, max_width=1220)
+        title = QLabel("Font Station", body)
         title.setObjectName("settingsPageTitle")
         lay.addWidget(title)
+
+        station = QFrame(body)
+        station.setObjectName("fontStationPanel")
+        station_l = QVBoxLayout(station)
+        station_l.setContentsMargins(16, 16, 16, 16)
+        station_l.setSpacing(12)
         form = QFormLayout()
         self._fonts_family_combo = FocusSafeComboBox(body)
         try:
@@ -16507,16 +17125,29 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         if idx >= 0:
             self._fonts_family_combo.setCurrentIndex(idx)
         self._fonts_scale_slider = PassiveWheelSlider(Qt.Horizontal, body)
-        self._fonts_scale_slider.setRange(85, 120)
+        self._fonts_scale_slider.setRange(80, 130)
         self._fonts_scale_slider.setValue(int(self._typography_settings().get("scale", 100) or 100))
+        self._fonts_weight_combo = FocusSafeComboBox(body)
+        for label, weight in (("Regular", 400), ("Medium", 500), ("Semi Bold", 600), ("Bold", 700)):
+            self._fonts_weight_combo.addItem(label, weight)
+        weight_idx = self._fonts_weight_combo.findData(int(self._typography_settings().get("weight", 500) or 500))
+        self._fonts_weight_combo.setCurrentIndex(weight_idx if weight_idx >= 0 else 1)
+        self._fonts_density_combo = FocusSafeComboBox(body)
+        self._fonts_density_combo.addItems(["Compact", "Balanced", "Cinematic", "Large"])
+        density_idx = self._fonts_density_combo.findText(str(self._typography_settings().get("density", "Balanced")))
+        self._fonts_density_combo.setCurrentIndex(density_idx if density_idx >= 0 else 1)
         form.addRow("Font family", self._fonts_family_combo)
         form.addRow("Global scale", self._fonts_scale_slider)
-        lay.addLayout(form)
-        preview = QLabel("OMEGA Preview\nPage title, section title, body, metadata, button text, and card captions use one scale.", body)
-        preview.setObjectName("settingsPreviewText")
-        preview.setWordWrap(True)
-        preview.setMinimumHeight(110)
-        lay.addWidget(preview)
+        form.addRow("Font weight", self._fonts_weight_combo)
+        form.addRow("Density preset", self._fonts_density_combo)
+        station_l.addLayout(form)
+        preset_row = QHBoxLayout()
+        for label, scale, weight in (("Compact", 92, 500), ("Balanced", 100, 500), ("Cinematic", 108, 600), ("Large", 118, 500)):
+            btn = QPushButton(label, station)
+            btn.clicked.connect(lambda _checked=False, s=scale, w=weight, d=label: self._fonts_apply_preset_to_controls(s, w, d))
+            preset_row.addWidget(btn)
+        preset_row.addStretch(1)
+        station_l.addLayout(preset_row)
         row = QHBoxLayout()
         apply_btn = QPushButton("Apply Typography", body)
         reset_btn = QPushButton("Reset", body)
@@ -16525,28 +17156,136 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         row.addWidget(apply_btn)
         row.addWidget(reset_btn)
         row.addStretch(1)
-        lay.addLayout(row)
-        lay.addStretch(1)
+        station_l.addLayout(row)
+        lay.addWidget(station)
 
-    def _typography_settings(self) -> Dict[str, Any]:
+        self._fonts_token_label = QLabel("", body)
+        self._fonts_token_label.setObjectName("settingsMutedText")
+        self._fonts_token_label.setWordWrap(True)
+        lay.addWidget(self._fonts_token_label)
+
+        preview_grid = QGridLayout()
+        preview_grid.setHorizontalSpacing(12)
+        preview_grid.setVerticalSpacing(12)
+        self._fonts_preview_widgets = []
+        preview_specs = [
+            ("Home Rail Card Preview", ["Rail Title", "Card Title", "Card subtitle metadata"]),
+            ("Settings Form Preview", ["Page Title", "Section title", "Body copy explaining a preference."]),
+            ("Media Metadata Preview", ["Movie Title (1999)", "Runtime  |  Source  |  Confidence", "Small muted provider label"]),
+            ("Player Control Bar Preview", ["Prev Ch", "Play", "Next Ch"]),
+            ("Button Row Preview", ["Primary", "Secondary", "Ghost"]),
+            ("Input & Tab Preview", ["Selected Tab", "Input text", "Small muted label"]),
+        ]
+        for idx, (heading, lines) in enumerate(preview_specs):
+            card = self._fonts_create_preview_card(body, heading, lines)
+            self._fonts_preview_widgets.append(card)
+            preview_grid.addWidget(card, idx // 2, idx % 2)
+        lay.addLayout(preview_grid)
+        lay.addStretch(1)
+        for control in (self._fonts_family_combo, self._fonts_weight_combo, self._fonts_density_combo):
+            if control is not None:
+                control.currentIndexChanged.connect(lambda _idx=0: self._fonts_refresh_preview())
+        if self._fonts_scale_slider is not None:
+            self._fonts_scale_slider.valueChanged.connect(lambda _value=0: self._fonts_refresh_preview())
+        self._fonts_refresh_preview()
+
+    def _fonts_create_preview_card(self, parent: QWidget, heading: str, lines: List[str]) -> QWidget:
+        card = QFrame(parent)
+        card.setObjectName("fontPreviewCard")
+        card.setMinimumHeight(170)
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(8)
+        title = QLabel(str(heading), card)
+        title.setObjectName("fontPreviewHeading")
+        lay.addWidget(title)
+        for idx, text in enumerate(lines):
+            label = QLabel(str(text), card)
+            label.setObjectName(f"fontPreviewLine{idx}")
+            label.setWordWrap(True)
+            lay.addWidget(label)
+        if "Button" in heading or "Player" in heading:
+            row = QHBoxLayout()
+            for text in lines[:3]:
+                btn = QPushButton(str(text), card)
+                row.addWidget(btn)
+            row.addStretch(1)
+            lay.addLayout(row)
+        if "Input" in heading:
+            lay.addWidget(QLineEdit("Search metadata title", card))
+        lay.addStretch(1)
+        return card
+
+    def _fonts_apply_preset_to_controls(self, scale: int, weight: int, density: str) -> None:
+        if self._fonts_scale_slider is not None:
+            self._fonts_scale_slider.setValue(int(scale))
+        if self._fonts_weight_combo is not None:
+            idx = self._fonts_weight_combo.findData(int(weight))
+            if idx >= 0:
+                self._fonts_weight_combo.setCurrentIndex(idx)
+        if self._fonts_density_combo is not None:
+            idx = self._fonts_density_combo.findText(str(density))
+            if idx >= 0:
+                self._fonts_density_combo.setCurrentIndex(idx)
+        self._fonts_refresh_preview()
+
+    def _fonts_refresh_preview(self) -> None:
+        settings = self._typography_settings(from_controls=True)
+        family = str(settings.get("family") or "Segoe UI")
+        scale = int(settings.get("scale", 100) or 100)
+        weight = int(settings.get("weight", 500) or 500)
+        density = str(settings.get("density", "Balanced") or "Balanced")
+        factor = max(0.8, min(1.3, scale / 100.0))
+        base = max(8, int(round(float(self.T.typography.base_point_size) * factor)))
+        page = max(base + 7, int(round(float(self.T.typography.page_title_point_size) * factor)))
+        section = max(base + 3, int(round(float(self.T.typography.section_title_point_size) * factor)))
+        caption = max(8, int(round(float(self.T.typography.card_meta_point_size) * factor)))
+        button = max(9, int(round(float(self.T.typography.button_point_size) * factor)))
+        if self._fonts_token_label is not None:
+            self._fonts_token_label.setText(
+                f"Active tokens preview: family {family} | base {base}px | scale {scale}% | "
+                f"title {page}px | section {section}px | body {base}px | caption {caption}px | "
+                f"button {button}px | weight {weight} | density {density}"
+            )
+        for card in list(getattr(self, "_fonts_preview_widgets", []) or []):
+            try:
+                card.setStyleSheet(
+                    f"QFrame#fontPreviewCard {{ border-radius: 16px; padding: 2px; }}"
+                    f"QLabel {{ font-family: '{family}', 'Segoe UI', Arial; font-size: {base}px; font-weight: {weight}; }}"
+                    f"QLabel#fontPreviewHeading {{ font-size: {section}px; font-weight: 700; }}"
+                    f"QLabel#fontPreviewLine0 {{ font-size: {section}px; font-weight: 700; }}"
+                    f"QLabel#fontPreviewLine2 {{ font-size: {caption}px; }}"
+                    f"QPushButton {{ font-family: '{family}', 'Segoe UI', Arial; font-size: {button}px; font-weight: {weight}; }}"
+                    f"QLineEdit {{ font-family: '{family}', 'Segoe UI', Arial; font-size: {base}px; }}"
+                )
+            except Exception:
+                pass
+
+    def _typography_settings(self, *, from_controls: bool = False) -> Dict[str, Any]:
+        if from_controls:
+            family = str(self._fonts_family_combo.currentText()) if self._fonts_family_combo is not None else str(self.T.typography.preferred_family or "Segoe UI")
+            scale = int(self._fonts_scale_slider.value()) if self._fonts_scale_slider is not None else 100
+            weight = int(self._fonts_weight_combo.currentData() or 500) if self._fonts_weight_combo is not None else 500
+            density = str(self._fonts_density_combo.currentText()) if self._fonts_density_combo is not None else "Balanced"
+            return {"family": family, "scale": scale, "weight": weight, "density": density}
         raw = self._personalization.get("typography", {})
         if not isinstance(raw, dict):
             raw = {}
         return {
             "family": str(raw.get("family") or self.T.typography.preferred_family or "Segoe UI"),
-            "scale": int(max(85, min(120, int(raw.get("scale", 100) or 100)))),
+            "scale": int(max(80, min(130, int(raw.get("scale", 100) or 100)))),
+            "weight": int(max(300, min(800, int(raw.get("weight", 500) or 500)))),
+            "density": str(raw.get("density") or "Balanced"),
         }
 
     def _fonts_apply_settings(self) -> None:
-        family = str(self._fonts_family_combo.currentText() if self._fonts_family_combo is not None else "Segoe UI")
-        scale = int(self._fonts_scale_slider.value() if self._fonts_scale_slider is not None else 100)
-        self._personalization["typography"] = {"family": family, "scale": scale}
+        self._personalization["typography"] = self._typography_settings(from_controls=True)
         self._personalization_save()
         self._app_apply_typography()
         self._personalization_apply_current_theme()
 
     def _fonts_reset_settings(self) -> None:
-        self._personalization["typography"] = {"family": "Segoe UI", "scale": 100}
+        self._personalization["typography"] = {"family": "Segoe UI", "scale": 100, "weight": 500, "density": "Balanced"}
         self._personalization_save()
         self._app_apply_typography()
         self._personalization_apply_current_theme()
@@ -16556,15 +17295,22 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
                 self._fonts_family_combo.setCurrentIndex(idx)
         if self._fonts_scale_slider is not None:
             self._fonts_scale_slider.setValue(100)
+        if self._fonts_weight_combo is not None:
+            idx = self._fonts_weight_combo.findData(500)
+            if idx >= 0:
+                self._fonts_weight_combo.setCurrentIndex(idx)
+        if self._fonts_density_combo is not None:
+            idx = self._fonts_density_combo.findText("Balanced")
+            if idx >= 0:
+                self._fonts_density_combo.setCurrentIndex(idx)
+        self._fonts_refresh_preview()
 
     def _layout_build_tabbed_page(self, tab: QWidget) -> None:
-        root = QVBoxLayout(tab)
-        root.setContentsMargins(12, 12, 12, 18)
-        root.setSpacing(12)
-        title = QLabel("Layout", tab)
+        body, root = self._make_page_scroll(tab, max_width=1560)
+        title = QLabel("Layout", body)
         title.setObjectName("settingsPageTitle")
         root.addWidget(title)
-        tabs = QTabWidget(tab)
+        tabs = QTabWidget(body)
         tabs.setObjectName("layoutContextTabs")
         root.addWidget(tabs, 1)
         for key, label in (("home", "Home Layout"), ("player", "Player Layout"), ("library", "Library Layout"), ("settings", "Settings Layout")):
@@ -16574,7 +17320,8 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             page_l.setSpacing(10)
             page_l.addWidget(QLabel(f"{label} controls", page))
             preview = PageLayoutMiniPreview(page)
-            preview.setMinimumHeight(260)
+            preview.setMinimumHeight(420)
+            self._layout_configure_preview(preview, key, label)
             page_l.addWidget(preview, 1)
             row = QHBoxLayout()
             reset_btn = QPushButton("Reset This Layout", page)
@@ -16586,6 +17333,60 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             row.addStretch(1)
             page_l.addLayout(row)
             tabs.addTab(page, label)
+        root.addStretch(1)
+
+    def _layout_configure_preview(self, preview: PageLayoutMiniPreview, key: str, label: str) -> None:
+        colors = dict(self._personalization.get("colors", {}) or {})
+        if key == "library":
+            cfg = self._page_layouts_discover_config()
+            preview.set_preview(
+                colors=colors,
+                items=list(cfg.get("items", []) or []),
+                component_labels={name: self._discover_layout_component_label(name) for name in DISCOVER_COMPONENT_LABELS},
+                canvas_cols=int(cfg.get("canvas_cols", DISCOVER_LAYOUT_COLS) or DISCOVER_LAYOUT_COLS),
+                canvas_rows=int(cfg.get("canvas_rows", DISCOVER_LAYOUT_ROWS) or DISCOVER_LAYOUT_ROWS),
+                title=label,
+                footer_note="Media Studio and library dashboard layout.",
+            )
+            return
+        if key == "settings":
+            cfg = self._page_layouts_settings_config()
+            preview.set_preview(
+                colors=colors,
+                items=list(cfg.get("items", []) or []),
+                component_labels={name: self._settings_layout_component_label(name) for name in SETTINGS_COMPONENT_LABELS},
+                canvas_cols=int(cfg.get("canvas_cols", SETTINGS_LAYOUT_COLS) or SETTINGS_LAYOUT_COLS),
+                canvas_rows=int(cfg.get("canvas_rows", SETTINGS_LAYOUT_ROWS) or SETTINGS_LAYOUT_ROWS),
+                title=label,
+                footer_note="Settings hub layout blocks.",
+            )
+            return
+        if key == "player":
+            cfg = self._page_layouts_player_config()
+            preview.set_preview(
+                colors=colors,
+                items=list(cfg.get("items", []) or []),
+                component_labels={name: self._player_layout_component_label(name) for name in PLAYER_COMPONENT_LABELS},
+                canvas_cols=int(cfg.get("canvas_cols", PLAYER_LAYOUT_COLS) or PLAYER_LAYOUT_COLS),
+                canvas_rows=int(cfg.get("canvas_rows", PLAYER_LAYOUT_ROWS) or PLAYER_LAYOUT_ROWS),
+                title=label,
+                footer_note="Video stage, controls, playlist, and command center.",
+            )
+            return
+        preview.set_preview(
+            colors=colors,
+            items=[
+                {"id": "hero", "component": "hero", "x": 0, "y": 0, "w": 24, "h": 5},
+                {"id": "continue", "component": "continue", "x": 0, "y": 5, "w": 24, "h": 3},
+                {"id": "rails", "component": "rails", "x": 0, "y": 8, "w": 24, "h": 5},
+                {"id": "dock", "component": "dock", "x": 6, "y": 13, "w": 12, "h": 1},
+            ],
+            component_labels={"hero": "Hero", "continue": "Continue Watching", "rails": "Home Rails", "dock": "Bottom Dock"},
+            canvas_cols=24,
+            canvas_rows=14,
+            title=label,
+            footer_note="Home rail/hero layout overview.",
+        )
 
     def _layout_reset_context(self, key: str) -> None:
         defaults = self._page_layouts_default()
@@ -16605,20 +17406,61 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         else:
             self._home_request_build()
 
-    def _settings_build_intro_animation_section(self, parent: QWidget, layout: QVBoxLayout) -> None:
-        group = QGroupBox("Startup & Home Intro", parent)
-        group.setObjectName("layoutStudioGroup")
-        group_l = QVBoxLayout(group)
-        group_l.setContentsMargins(16, 16, 16, 16)
-        group_l.setSpacing(10)
-        lead = QLabel("Choose how Omega reveals Home after profile entry. Animations are Qt-safe fades so layout measurement stays stable.", group)
-        lead.setObjectName("studioGroupLead")
-        lead.setWordWrap(True)
-        group_l.addWidget(lead)
+    def _settings_build_general_tab(self, tab: QWidget) -> None:
+        body, lay = self._make_page_scroll(tab, max_width=980)
+        title = QLabel("Settings", body)
+        title.setObjectName("settingsPageTitle")
+        lay.addWidget(title)
+
+        self._settings_build_overview(body, lay)
+
+        general = QGroupBox("General App Controls", body)
+        general.setObjectName("layoutStudioGroup")
+        general_l = QVBoxLayout(general)
+        general_l.setContentsMargins(16, 16, 16, 16)
+        general_l.setSpacing(10)
         row = QHBoxLayout()
-        self._intro_animation_enabled_check = QCheckBox("Enable intro animation", group)
+        for label, handler in (
+            ("Profiles", self._viewer_show_startup_gate),
+            ("Refresh Catalog", lambda: self._home_catalog_start_async_refresh("settings-general", allow_network=True)),
+            ("Performance Monitor", self._perf_open_monitor),
+        ):
+            btn = QPushButton(label, general)
+            btn.clicked.connect(handler)
+            row.addWidget(btn)
+        row.addStretch(1)
+        general_l.addLayout(row)
+        skip_row = QHBoxLayout()
+        intro = QCheckBox("Auto-skip intro markers", general)
+        intro.setChecked(bool(self._segment_skip_store.get_auto_skip("intro")))
+        intro.toggled.connect(lambda enabled: self._player_toggle_auto_skip("intro", bool(enabled)))
+        outro = QCheckBox("Auto-skip outro markers", general)
+        outro.setChecked(bool(self._segment_skip_store.get_auto_skip("outro")))
+        outro.toggled.connect(lambda enabled: self._player_toggle_auto_skip("outro", bool(enabled)))
+        skip_row.addWidget(intro)
+        skip_row.addWidget(outro)
+        skip_row.addStretch(1)
+        general_l.addLayout(skip_row)
+        lay.addWidget(general)
+
+        lay.addWidget(self._settings_build_changelog_panel(body))
+        lay.addStretch(1)
+
+    def _intro_build_tab(self, tab: QWidget) -> None:
+        body, lay = self._make_page_scroll(tab, max_width=1120)
+        title = QLabel("Intro Animations", body)
+        title.setObjectName("settingsPageTitle")
+        lay.addWidget(title)
+
+        controls = QGroupBox("Home Entry Animation", body)
+        controls.setObjectName("layoutStudioGroup")
+        controls_l = QVBoxLayout(controls)
+        controls_l.setContentsMargins(16, 16, 16, 16)
+        controls_l.setSpacing(12)
+        form = QFormLayout()
+        self._intro_animation_enabled_check = QCheckBox("Enable animation", controls)
         self._intro_animation_enabled_check.setChecked(bool(self._intro_animation_settings().get("enabled", True)))
-        self._intro_animation_combo = FocusSafeComboBox(group)
+        self._intro_animation_combo = FocusSafeComboBox(controls)
         self._intro_animation_combo.addItems([
             "Rail Cascade",
             "Cinematic Aperture",
@@ -16626,20 +17468,98 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             "Poster Constellation",
             "Command Sweep",
             "Minimal Fade",
+            "No Animation",
         ])
         idx = self._intro_animation_combo.findText(str(self._intro_animation_settings().get("style", "Rail Cascade")))
         if idx >= 0:
             self._intro_animation_combo.setCurrentIndex(idx)
-        save_btn = QPushButton("Save Intro", group)
-        preview_btn = QPushButton("Preview", group)
+        self._intro_animation_duration_combo = FocusSafeComboBox(controls)
+        self._intro_animation_duration_combo.addItems(["Fast", "Balanced", "Cinematic"])
+        dur_idx = self._intro_animation_duration_combo.findText(str(self._intro_animation_settings().get("duration", "Balanced")))
+        self._intro_animation_duration_combo.setCurrentIndex(dur_idx if dur_idx >= 0 else 1)
+        self._intro_animation_play_once_check = QCheckBox("Play once per launch", controls)
+        self._intro_animation_play_once_check.setChecked(bool(self._intro_animation_settings().get("play_once", True)))
+        form.addRow("Enabled", self._intro_animation_enabled_check)
+        form.addRow("Animation", self._intro_animation_combo)
+        form.addRow("Speed", self._intro_animation_duration_combo)
+        form.addRow("Repeat", self._intro_animation_play_once_check)
+        controls_l.addLayout(form)
+        row = QHBoxLayout()
+        save_btn = QPushButton("Save Intro Animation", controls)
+        preview_btn = QPushButton("Preview Selected", controls)
+        reset_btn = QPushButton("Reset", controls)
         save_btn.clicked.connect(self._intro_animation_save_settings)
-        preview_btn.clicked.connect(self._home_play_intro_animation)
-        row.addWidget(self._intro_animation_enabled_check)
-        row.addWidget(self._intro_animation_combo, 1)
+        preview_btn.clicked.connect(lambda _checked=False: self._home_play_intro_animation(force=True))
+        reset_btn.clicked.connect(self._intro_animation_reset_settings)
         row.addWidget(save_btn)
         row.addWidget(preview_btn)
-        group_l.addLayout(row)
-        layout.addWidget(group)
+        row.addWidget(reset_btn)
+        row.addStretch(1)
+        controls_l.addLayout(row)
+        lay.addWidget(controls)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(12)
+        descriptions = [
+            ("Rail Cascade", "Rails fade in one after another with a clean media-command rhythm."),
+            ("Cinematic Aperture", "A dark cinematic reveal that feels like a lens opening."),
+            ("Glass Console Boot", "Panels come online with a polished command-console feel."),
+            ("Poster Constellation", "Poster ghosts appear softly before the Home rails settle."),
+            ("Command Sweep", "A subtle sweep reveals the page sections."),
+            ("Minimal Fade", "Fast, quiet, and practical."),
+            ("No Animation", "Disable the effect entirely."),
+        ]
+        for idx, (name, desc) in enumerate(descriptions):
+            grid.addWidget(self._intro_create_option_card(body, name, desc), idx // 2, idx % 2)
+        lay.addLayout(grid)
+        lay.addStretch(1)
+
+    def _intro_create_option_card(self, parent: QWidget, name: str, description: str) -> QWidget:
+        card = QFrame(parent)
+        card.setObjectName("introOptionCard")
+        card.setMinimumHeight(132)
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(7)
+        title = QLabel(str(name), card)
+        title.setObjectName("settingsSectionTitle")
+        body = QLabel(str(description), card)
+        body.setObjectName("settingsMutedText")
+        body.setWordWrap(True)
+        choose = QPushButton("Select", card)
+        choose.clicked.connect(lambda _checked=False, value=name: self._intro_select_animation(value))
+        lay.addWidget(title)
+        lay.addWidget(body)
+        lay.addStretch(1)
+        lay.addWidget(choose)
+        return card
+
+    def _intro_select_animation(self, name: str) -> None:
+        if self._intro_animation_combo is not None:
+            idx = self._intro_animation_combo.findText(str(name))
+            if idx >= 0:
+                self._intro_animation_combo.setCurrentIndex(idx)
+        if str(name) == "No Animation" and self._intro_animation_enabled_check is not None:
+            self._intro_animation_enabled_check.setChecked(False)
+        elif self._intro_animation_enabled_check is not None:
+            self._intro_animation_enabled_check.setChecked(True)
+
+    def _intro_animation_reset_settings(self) -> None:
+        self._personalization["intro_animation"] = {"enabled": True, "style": "Rail Cascade", "duration": "Balanced", "play_once": True}
+        self._personalization_save()
+        if self._intro_animation_enabled_check is not None:
+            self._intro_animation_enabled_check.setChecked(True)
+        if self._intro_animation_combo is not None:
+            idx = self._intro_animation_combo.findText("Rail Cascade")
+            if idx >= 0:
+                self._intro_animation_combo.setCurrentIndex(idx)
+        if self._intro_animation_duration_combo is not None:
+            idx = self._intro_animation_duration_combo.findText("Balanced")
+            if idx >= 0:
+                self._intro_animation_duration_combo.setCurrentIndex(idx)
+        if self._intro_animation_play_once_check is not None:
+            self._intro_animation_play_once_check.setChecked(True)
 
     def _intro_animation_settings(self) -> Dict[str, Any]:
         raw = self._personalization.get("intro_animation", {})
@@ -16649,19 +17569,27 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             "enabled": bool(raw.get("enabled", True)),
             "style": str(raw.get("style") or "Rail Cascade"),
             "duration": str(raw.get("duration") or "Balanced"),
+            "play_once": bool(raw.get("play_once", True)),
         }
 
     def _intro_animation_save_settings(self) -> None:
+        style = str(self._intro_animation_combo.currentText()) if self._intro_animation_combo is not None else "Rail Cascade"
         self._personalization["intro_animation"] = {
             "enabled": bool(self._intro_animation_enabled_check.isChecked()) if self._intro_animation_enabled_check is not None else True,
-            "style": str(self._intro_animation_combo.currentText()) if self._intro_animation_combo is not None else "Rail Cascade",
-            "duration": "Balanced",
+            "style": style,
+            "duration": str(self._intro_animation_duration_combo.currentText()) if self._intro_animation_duration_combo is not None else "Balanced",
+            "play_once": bool(self._intro_animation_play_once_check.isChecked()) if self._intro_animation_play_once_check is not None else True,
         }
+        if style == "No Animation":
+            self._personalization["intro_animation"]["enabled"] = False
         self._personalization_save()
 
-    def _home_play_intro_animation(self) -> None:
+    def _home_play_intro_animation(self, *, force: bool = False) -> None:
         cfg = self._intro_animation_settings()
-        if not bool(cfg.get("enabled", True)):
+        style = str(cfg.get("style", "Rail Cascade") or "Rail Cascade")
+        if style == "No Animation" or not bool(cfg.get("enabled", True)):
+            return
+        if bool(cfg.get("play_once", True)) and bool(getattr(self, "_home_intro_played_this_launch", False)) and not bool(force):
             return
         target = self.homeContent if self.homeContent is not None else self.homePage
         if target is None:
@@ -16677,12 +17605,16 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         anim = QPropertyAnimation(effect, b"opacity", self)
         anim.setStartValue(0.0)
         anim.setEndValue(1.0)
-        style = str(cfg.get("style", "Rail Cascade"))
-        anim.setDuration(520 if style == "Minimal Fade" else 780)
+        duration_key = str(cfg.get("duration", "Balanced") or "Balanced")
+        duration = {"Fast": 420, "Balanced": 720, "Cinematic": 980}.get(duration_key, 720)
+        if style == "Minimal Fade":
+            duration = min(duration, 520)
+        anim.setDuration(int(duration))
         anim.setEasingCurve(QEasingCurve.OutCubic)
         anim.finished.connect(lambda: target.setGraphicsEffect(None))
         self._home_intro_effect = effect
         self._home_intro_anim = anim
+        self._home_intro_played_this_launch = True
         anim.start()
 
     def _search_create_discover_dock(self, object_name: str, title: str, widget: QWidget) -> QDockWidget:
@@ -19372,6 +20304,7 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
                     show_dirs=show_dirs,
                     poster_path=Path(str(poster_raw)) if poster_raw is not None else None,
                     backdrop_path=Path(str(backdrop_raw)) if backdrop_raw is not None else None,
+                    title_id=str(getattr(sg, "title_id", "") or key),
                 )
             )
 
@@ -20148,8 +21081,8 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             "home_chrome": self._home_chrome_default(default_name),
             "player_chrome_windowed": self._player_chrome_default(default_name),
             "player_chrome_fullscreen": self._player_chrome_default(default_name),
-            "typography": {"family": str(self.T.typography.preferred_family or "Segoe UI"), "scale": 100},
-            "intro_animation": {"enabled": True, "style": "Rail Cascade", "duration": "Balanced"},
+            "typography": {"family": str(self.T.typography.preferred_family or "Segoe UI"), "scale": 100, "weight": 500, "density": "Balanced"},
+            "intro_animation": {"enabled": True, "style": "Rail Cascade", "duration": "Balanced", "play_once": True},
         }
 
     def _personalization_merge_from_state(self) -> None:
@@ -20204,9 +21137,14 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             typography = dict(typography)
             typography["family"] = str(raw.get("typography", {}).get("family") or typography.get("family") or "Segoe UI")
             try:
-                typography["scale"] = int(max(85, min(120, int(raw.get("typography", {}).get("scale", typography.get("scale", 100)) or 100))))
+                typography["scale"] = int(max(80, min(130, int(raw.get("typography", {}).get("scale", typography.get("scale", 100)) or 100))))
             except Exception:
                 typography["scale"] = 100
+            try:
+                typography["weight"] = int(max(300, min(800, int(raw.get("typography", {}).get("weight", typography.get("weight", 500)) or 500))))
+            except Exception:
+                typography["weight"] = 500
+            typography["density"] = str(raw.get("typography", {}).get("density") or typography.get("density") or "Balanced")
         out["typography"] = typography
         intro = base.get("intro_animation", {}) if isinstance(base.get("intro_animation"), dict) else {}
         if isinstance(raw.get("intro_animation"), dict):
@@ -20214,6 +21152,7 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             intro["enabled"] = bool(raw.get("intro_animation", {}).get("enabled", intro.get("enabled", True)))
             intro["style"] = str(raw.get("intro_animation", {}).get("style") or intro.get("style") or "Rail Cascade")
             intro["duration"] = str(raw.get("intro_animation", {}).get("duration") or intro.get("duration") or "Balanced")
+            intro["play_once"] = bool(raw.get("intro_animation", {}).get("play_once", intro.get("play_once", True)))
         out["intro_animation"] = intro
 
         self._personalization = out
@@ -22444,6 +23383,13 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         scale = float(typography.get("scale", 100) or 100) / 100.0
         font = QFont(str(typography.get("family") or self.T.typography.preferred_family or "Segoe UI"))
         font.setPointSize(max(8, int(round(float(self.T.typography.base_point_size) * scale))))
+        try:
+            font.setWeight(QFont.Weight(int(typography.get("weight", 500) or 500)))
+        except Exception:
+            try:
+                font.setBold(int(typography.get("weight", 500) or 500) >= 650)
+            except Exception:
+                pass
         app.setFont(font)
 
     def _current_theme_category(self) -> str:
@@ -22886,7 +23832,6 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         canvas_l.addWidget(hero)
 
         self._settings_build_overview(canvas, canvas_l)
-        self._settings_build_intro_animation_section(canvas, canvas_l)
         self._viewer_profile_build_studio(canvas, canvas_l)
 
         theme_group = QGroupBox("Theme Theater", canvas)
@@ -24153,10 +25098,11 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         is_transparent = not is_solid
         is_light = self._theme_category_is_light(theme_category)
         font_family = self._theme_font_family_css()
-        section_title_px = int(self.T.typography.section_title_point_size)
-        page_title_px = int(self.T.typography.page_title_point_size)
-        rail_meta_px = int(self.T.typography.rail_meta_point_size)
-        button_px = int(self.T.typography.button_point_size)
+        typography_scale = max(0.8, min(1.3, float(self._typography_settings().get("scale", 100) or 100) / 100.0))
+        section_title_px = max(9, int(round(float(self.T.typography.section_title_point_size) * typography_scale)))
+        page_title_px = max(11, int(round(float(self.T.typography.page_title_point_size) * typography_scale)))
+        rail_meta_px = max(8, int(round(float(self.T.typography.rail_meta_point_size) * typography_scale)))
+        button_px = max(8, int(round(float(self.T.typography.button_point_size) * typography_scale)))
 
         solid_container_bg = bg_hex if is_solid else "transparent"
         solid_scroll_bg = surface_soft if is_solid else "transparent"
@@ -25559,9 +26505,13 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             QMessageBox.information(self.win, "No New Folders Added", "\n\n".join(details))
             return
 
+        dprint(
+            f"[SOURCE][ADD] added={len(added)} duplicates={len(duplicates)} invalid={len(invalid)} "
+            f"sources={[str(p) for p in added]}"
+        )
         self._home_catalog_needs_refresh = True
         self._home_catalog_start_async_refresh("source-added", allow_network=True)
-        self._home_build()
+        self._home_request_build()
 
         details = [f"Added {len(added)} folder(s) to your library."]
         if duplicates:
@@ -27269,10 +28219,21 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         current = tabs.currentWidget()
         if current is getattr(self, "_search_personalize_tab", None):
             self._settings_refresh_overview(force=False)
+            return
+        if current is getattr(self, "_search_layout_tab", None):
             self._discover_layout_sync_editor_from_state()
             self._settings_layout_sync_editor_from_state()
             self._player_layout_sync_editor_from_state()
             self._studio_refresh_live_previews()
+            return
+        if current is getattr(self, "_search_media_library_tab", None):
+            self._media_library_refresh_list()
+            return
+        if current is getattr(self, "_search_sources_tab", None):
+            self._sources_refresh_page()
+            return
+        if current is getattr(self, "_search_fonts_tab", None):
+            self._fonts_refresh_preview()
             return
         if current is getattr(self, "_search_discover_tab", None):
             self._search_request_refresh()
@@ -27404,6 +28365,14 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         panel_l.addWidget(lead)
 
         entries = [
+            (
+                "2026-05-11-omega-library-ingestion-stability-performance-pass",
+                "Library Imports, Source Scans, and Restart Safety: Omega now keeps library/title snapshots in a durable JSON repository with atomic saves and backups, runs source and home refresh work in the background, keeps Home on last known committed data instead of freezing on startup, adds diagnostics and repair controls for library health, and includes local fake-library coverage for repeatable 20-title batch imports without needing network access.",
+            ),
+            (
+                "2026-05-05-omega-settings-hub-tabs-themes-fonts-layout-animation-followup",
+                "Settings Hub Tabs, Theme Gallery, Font Station, Layout Fixes, and Intro Animations: the main navigation is now Home, Player, and Settings only; Settings owns Library, Media Library, Sources, Themes, Fonts, Layout, Intro Animations, and general Settings tabs; compact tabs use centered content lanes; theme cards now render each real theme's colors; Font Station exposes family, scale, weight, density presets, token readouts, and contextual previews; Layout sub-tabs are separated by context; and intro animation selection is its own persisted Settings tab.",
+            ),
             (
                 "2026-05-05-omega-library-settings-layout-metadata-revamp",
                 "Library, Settings, Layout, Metadata, Theme, Font, and Startup Revamp: navigation is split into focused Media Library, Sources, Themes, Fonts, Layout, Player, and Settings areas; source refresh now shows ready-to-add parsed candidates live; metadata/art editing has a cleaner master-detail surface; chapter controls were added to the player bar; and Home intro animation settings were introduced to reduce the old all-in-one Settings clutter.",
@@ -27562,6 +28531,32 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         watch_l.addWidget(library_health)
         panel_l.addWidget(watch_group)
 
+        diagnostics_group = QGroupBox("Library Diagnostics", panel)
+        diagnostics_l = QVBoxLayout(diagnostics_group)
+        diagnostics_l.setContentsMargins(12, 10, 12, 10)
+        diagnostics_l.setSpacing(8)
+        diag_summary = QLabel("", diagnostics_group)
+        diag_summary.setObjectName("studioGroupLead")
+        diag_summary.setWordWrap(True)
+        diagnostics_l.addWidget(diag_summary)
+        diag_status = QLabel("", diagnostics_group)
+        diag_status.setObjectName("studioGroupLead")
+        diag_status.setWordWrap(True)
+        diagnostics_l.addWidget(diag_status)
+        diag_buttons = QHBoxLayout()
+        health_btn = QPushButton("Run Library Health Check", diagnostics_group)
+        health_btn.clicked.connect(self._library_run_health_check)
+        repair_btn = QPushButton("Repair Library Index", diagnostics_group)
+        repair_btn.clicked.connect(self._library_repair_index)
+        rebuild_btn = QPushButton("Rebuild Home", diagnostics_group)
+        rebuild_btn.clicked.connect(lambda: self._library_rebuild_home_from_committed_catalog(reason="settings-diagnostics"))
+        diag_buttons.addWidget(health_btn)
+        diag_buttons.addWidget(repair_btn)
+        diag_buttons.addWidget(rebuild_btn)
+        diag_buttons.addStretch(1)
+        diagnostics_l.addLayout(diag_buttons)
+        panel_l.addWidget(diagnostics_group)
+
         host_layout.addWidget(panel)
         self._settings_overview_panel = panel
         self._settings_overview_values = cards
@@ -27569,6 +28564,8 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         self._settings_overview_auto_outro = outro
         self._settings_overview_profile_focus = profile_focus
         self._settings_overview_library_health = library_health
+        self._settings_overview_library_diag_summary = diag_summary
+        self._settings_overview_library_diag_status = diag_status
 
     def _settings_refresh_overview(self, *, force: bool = False) -> None:
         values = getattr(self, "_settings_overview_values", None)
@@ -27581,6 +28578,12 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         sources = list(self._library.list_sources(enabled_only=False))
         enabled_sources = [src for src in sources if bool(getattr(src, "enabled", True))]
         items = list(getattr(self, "_home_catalog_items", []) or [])
+        if not items:
+            try:
+                items = list(self._library.load_title_groups())
+            except Exception:
+                items = []
+        health = self._library_health_snapshot()
         verified_count = len(self._home_state_verified_set())
         unresolved_count = sum(1 for sg in items if getattr(sg, "tmdb_id", None) is None)
         art_count = sum(1 for sg in items if getattr(sg, "poster_path", None) is not None or getattr(sg, "backdrop_path", None) is not None)
@@ -27596,6 +28599,9 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             int(art_count),
             int(len(sources)),
             int(len(enabled_sources)),
+            int(health.get("total_titles", len(items)) or 0),
+            int(health.get("available_sources", len(enabled_sources)) or 0),
+            int(health.get("unavailable_sources", max(0, len(sources) - len(enabled_sources))) or 0),
             int(profile_stats.get("continue", 0) or 0),
             int(profile_stats.get("saved_mixes", 0) or 0),
             int(profile_stats.get("recent", 0) or 0),
@@ -27636,15 +28642,46 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         health_label = getattr(self, "_settings_overview_library_health", None)
         if health_label is not None:
             health_label.setText(
-                "{titles} titles indexed, {unresolved} unresolved, {art} with local art, {favorites} saved to My List. Auto-skip intro is {intro}; auto-skip outro is {outro}.".format(
-                    titles=len(items),
+                "{titles} titles indexed, {unresolved} unresolved, {art} with local art, {favorites} saved to My List. Auto-skip intro is {intro}; auto-skip outro is {outro}. Library ingest is {ingest}.".format(
+                    titles=int(health.get("total_titles", len(items)) or len(items)),
                     unresolved=unresolved_count,
                     art=art_count,
                     favorites=favorite_count,
                     intro="on" if auto_intro else "off",
                     outro="on" if auto_outro else "off",
+                    ingest=str(health.get("active_ingestion_status", "idle") or "idle"),
                 )
             )
+
+        diag_summary = getattr(self, "_settings_overview_library_diag_summary", None)
+        if diag_summary is not None:
+            diag_summary.setText(
+                "Sources: {available}/{total} available, {unavailable} unavailable. Titles: {titles} total, {ready} ready, {partial} partial, {failed} failed.".format(
+                    available=int(health.get("available_sources", len(enabled_sources)) or 0),
+                    total=int(health.get("total_sources", len(sources)) or 0),
+                    unavailable=int(health.get("unavailable_sources", max(0, len(sources) - len(enabled_sources))) or 0),
+                    titles=int(health.get("total_titles", len(items)) or 0),
+                    ready=int(health.get("ready_titles", 0) or 0),
+                    partial=int(health.get("partial_titles", 0) or 0),
+                    failed=int(health.get("failed_titles", 0) or 0),
+                )
+            )
+
+        diag_status = getattr(self, "_settings_overview_library_diag_status", None)
+        if diag_status is not None:
+            latest_errors = list(health.get("latest_errors", ()) or ())
+            last_scan = int(health.get("last_scan_at", 0) or 0)
+            last_commit = int(health.get("last_successful_commit_at", 0) or 0)
+            last_error = latest_errors[0] if latest_errors else ""
+            diag_bits = [
+                f"Ingest: {str(health.get('active_ingestion_status', 'idle') or 'idle')}",
+                f"Batch: {str(health.get('active_batch_id', '') or 'none')}",
+                f"Last scan: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_scan)) if last_scan else 'never'}",
+                f"Last commit: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_commit)) if last_commit else 'never'}",
+            ]
+            if last_error:
+                diag_bits.append(f"Latest error: {last_error}")
+            diag_status.setText(" | ".join(diag_bits))
 
         intro = getattr(self, "_settings_overview_auto_intro", None)
         if intro is not None:
@@ -27969,6 +29006,12 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
         sources = list(self._library.list_sources(enabled_only=False))
         enabled_sources = [src for src in sources if bool(getattr(src, "enabled", True))]
         items = list(getattr(self, "_home_catalog_items", []) or [])
+        if not items:
+            try:
+                items = list(self._library.load_title_groups())
+            except Exception:
+                items = []
+        health = self._library_health_snapshot()
         verified_keys = self._home_state_verified_set()
         favorites = [str(x).strip() for x in (self._home_state.get("favorites", []) or []) if str(x).strip()]
         watched_map = self._home_state.get("watched", {}) if isinstance(self._home_state.get("watched"), dict) else {}
@@ -27983,6 +29026,9 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             int(len(sources)),
             tuple((str(getattr(src, "path", "") or ""), bool(getattr(src, "enabled", True))) for src in sources),
             int(len(items)),
+            int(health.get("total_titles", len(items)) or 0),
+            int(health.get("available_sources", len(enabled_sources)) or 0),
+            int(health.get("unavailable_sources", max(0, len(sources) - len(enabled_sources))) or 0),
             int(len(verified_keys)),
             int(metadata_ready),
             int(art_ready),
@@ -28008,18 +29054,26 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             progress.setValue(int(round(readiness * 1000.0)))
         progress_label = getattr(self, "_library_hq_progress_label", None)
         if progress_label is not None:
-            progress_label.setText(
-                "{pct}% ready: {verified} verified, {meta} metadata-rich, {art} with art.".format(
+            latest_errors = list(health.get("latest_errors", ()) or [])
+            latest_error = latest_errors[0] if latest_errors else ""
+            progress_text_value = (
+                "{pct}% ready: {verified} verified, {meta} metadata-rich, {art} with art. Ingest: {ingest}.".format(
                     pct=int(round(readiness * 100.0)),
                     verified=verified_count,
                     meta=metadata_ready,
                     art=art_ready,
+                    ingest=str(health.get("active_ingestion_status", "idle") or "idle"),
                 )
             )
+            if latest_error:
+                progress_text_value += f" Latest error: {latest_error}"
+            progress_label.setText(progress_text_value)
 
-        stat_values["titles"].setText(str(total_titles))
+        stat_values["titles"].setText(str(int(health.get("total_titles", total_titles) or total_titles)))
         stat_values["verified"].setText(f"{verified_count} staged")
-        stat_values["sources"].setText(f"{len(enabled_sources)}/{len(sources)} live")
+        stat_values["sources"].setText(
+            f"{int(health.get('available_sources', len(enabled_sources)) or len(enabled_sources))}/{int(health.get('total_sources', len(sources)) or len(sources))} live"
+        )
         stat_values["metadata"].setText(f"{metadata_ready}/{total_titles}" if total_titles else "0/0")
         stat_values["art"].setText(f"{art_ready}/{total_titles}" if total_titles else "0/0")
         stat_values["favorites"].setText(f"{len(favorites)} list / {watched_count} watched")
@@ -28049,7 +29103,11 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
                 if not note_bits:
                     note_bits.append("Healthy")
                 coverage_text = f"{ready_count}/{title_count} md | {local_art_count}/{title_count} art" if title_count else "No titles yet"
-                status_text = "Enabled" if bool(getattr(source, "enabled", True)) else "Paused"
+                if not src_path.exists():
+                    status_text = "Unavailable"
+                    dprint(f"[SOURCE][UNAVAILABLE] path={src_path}")
+                else:
+                    status_text = "Enabled" if bool(getattr(source, "enabled", True)) else "Paused"
                 folder_item = QTableWidgetItem(str(src_path))
                 folder_item.setData(Qt.UserRole, str(src_path))
                 table.setItem(row, 0, folder_item)
@@ -28068,6 +29126,8 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
             title_count = self._library_source_title_count(Path(src_path), items) if src_path else 0
             if not bool(getattr(source, "enabled", True)):
                 attention_rows.append(("Paused source", src_path, {"action": "open_folder", "path": src_path}))
+            elif src_path and not Path(src_path).exists():
+                attention_rows.append(("Unavailable source", src_path, {"action": "open_folder", "path": src_path}))
             elif title_count == 0:
                 attention_rows.append(("Empty source", src_path, {"action": "open_folder", "path": src_path}))
         for sg in unresolved[:4]:
@@ -28187,8 +29247,12 @@ QScrollArea#homeScrollArea QScrollBar::sub-page:vertical {{
                     " | ".join(subtitle_bits),
                     {"action": "show_details", "key": key},
                 )
-            )
+                )
         self._library_populate_action_list(getattr(self, "_library_hq_top_shelf_list", None), top_shelf_rows)
+
+        latest_errors = list(health.get("latest_errors", ()) or [])
+        if latest_errors:
+            dprint(f"[LIBRARY][ERROR] latest={latest_errors[0]}")
 
     def _library_ui_manage_sources_dialog(self) -> None:
         dialog = QDialog(self.win)

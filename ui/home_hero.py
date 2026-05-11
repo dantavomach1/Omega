@@ -26,6 +26,7 @@ class HeroEntry:
     overview: str
     image_path: Optional[Path]
     poster_path: Optional[Path] = None
+    title_id: str = ""
     media_type: str = ""
     eyebrow: str = ""
     badges: tuple[str, ...] = ()
@@ -664,9 +665,10 @@ class HomeHeroCarousel(QFrame):
         self._set_badges(item.badges)
 
         bg_src = item.image_path or item.poster_path
-        bg_px = cover_pixmap_cached(bg_src, self.width(), self.height())
+        namespace = str(item.title_id or item.content_key or "")
+        bg_px = cover_pixmap_cached(bg_src, self.width(), self.height(), cache_namespace=namespace)
         if bg_px.isNull() and item.poster_path is not None and item.poster_path != bg_src:
-            bg_px = cover_pixmap_cached(item.poster_path, self.width(), self.height())
+            bg_px = cover_pixmap_cached(item.poster_path, self.width(), self.height(), cache_namespace=namespace)
         bg_key = int(bg_px.cacheKey()) if not bg_px.isNull() else 0
         if bg_key != int(self._last_bg_cache_key):
             if bg_px.isNull():
@@ -677,7 +679,13 @@ class HomeHeroCarousel(QFrame):
 
         poster_src = item.poster_path or item.image_path
         target = self._poster_card.size()
-        poster_px = rounded_cover_pixmap_cached(poster_src, target.width(), target.height(), 18)
+        poster_px = rounded_cover_pixmap_cached(
+            poster_src,
+            target.width(),
+            target.height(),
+            18,
+            cache_namespace=namespace,
+        )
         poster_key = int(poster_px.cacheKey()) if not poster_px.isNull() else 0
         if poster_key != int(self._last_poster_cache_key):
             if poster_px.isNull():
