@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QImage, QPainter, QPainterPath, QPixmap, QPixmapCache, QRegion
+from PySide6.QtGui import QImage, QPainter, QPainterPath, QPixmap, QRegion
 from PySide6.QtWidgets import QLabel, QWidget
 
 try:
@@ -36,17 +36,6 @@ _ARTWORK_PREWARM_PENDING: set[str] = set()
 _ARTWORK_PREWARM_LOCK = threading.Lock()
 _ARTWORK_PREWARM_PAUSED = False
 _ARTWORK_PREWARM_STATE = threading.Condition(_ARTWORK_PREWARM_LOCK)
-_ART_CACHE_STATS = {
-    "hits": 0,
-    "misses": 0,
-    "writes": 0,
-    "broken": 0,
-}
-
-
-def _art_cache_inc(key: str, amount: int = 1) -> None:
-    current = int(_ART_CACHE_STATS.get(str(key), 0))
-    _ART_CACHE_STATS[str(key)] = max(0, current + int(amount))
 
 
 @dataclass(frozen=True)
@@ -73,11 +62,8 @@ def _spec_cache_key(spec: ArtworkVariantSpec) -> str:
 def _cache_get(cache: "OrderedDict[str, QPixmap]", key: str) -> QPixmap:
     pixmap = cache.get(str(key), QPixmap())
     if pixmap.isNull():
-        _art_cache_inc("misses")
-        _dprint(f"[ART][CACHE_MISS] memory key={str(key)[:96]}")
         return QPixmap()
-    _art_cache_inc("hits")
-    _dprint(f"[ART][CACHE_HIT] memory key={str(key)[:96]}")
+    _dprint(f"[ART][CACHE] memory-hit key={str(key)[:96]}")
     cache.move_to_end(str(key))
     return pixmap
 
@@ -85,14 +71,9 @@ def _cache_get(cache: "OrderedDict[str, QPixmap]", key: str) -> QPixmap:
 def _cache_put(cache: "OrderedDict[str, QPixmap]", key: str, pixmap: QPixmap, limit: int) -> QPixmap:
     if pixmap.isNull():
         return QPixmap()
-    _art_cache_inc("writes")
-    try:
-        QPixmapCache.insert(str(key), pixmap)
-    except Exception:
-        pass
     cache[str(key)] = pixmap
     cache.move_to_end(str(key))
-    _dprint(f"[ART][CACHE_WRITE] memory key={str(key)[:96]}")
+    _dprint(f"[ART][CACHE] memory-store key={str(key)[:96]}")
     while len(cache) > int(max(1, limit)):
         cache.popitem(last=False)
     return pixmap
@@ -174,8 +155,7 @@ def _variant_disk_path(cache_key: str) -> Optional[Path]:
 def _load_variant_pixmap(cache_key: str) -> QPixmap:
     disk_path = _variant_disk_path(cache_key)
     if disk_path is None or not disk_path.exists():
-        _art_cache_inc("misses")
-        _dprint(f"[ART][CACHE_MISS] disk key={str(cache_key)[:96]}")
+        _dprint(f"[ART][CACHE] disk-miss key={str(cache_key)[:96]}")
         return QPixmap()
     pixmap = QPixmap(str(disk_path))
     if pixmap.isNull():
@@ -183,11 +163,9 @@ def _load_variant_pixmap(cache_key: str) -> QPixmap:
             disk_path.unlink()
         except Exception:
             pass
-        _art_cache_inc("broken")
-        _dprint(f"[ART][BROKEN] disk-corrupt key={str(cache_key)[:96]}")
+        _dprint(f"[ART][CACHE] disk-corrupt key={str(cache_key)[:96]}")
         return QPixmap()
-    _art_cache_inc("hits")
-    _dprint(f"[ART][CACHE_HIT] disk key={str(cache_key)[:96]}")
+    _dprint(f"[ART][CACHE] disk-hit key={str(cache_key)[:96]}")
     return pixmap
 
 
@@ -298,8 +276,6 @@ def _ensure_variant_file(
         if cancel_check is not None and cancel_check():
             return None
         if not variant.save(str(tmp_path), "PNG"):
-            _art_cache_inc("broken")
-            _dprint(f"[ART][BROKEN] save-failed key={str(cache_key)[:96]}")
             return None
         if cancel_check is not None and cancel_check():
             return None
@@ -307,11 +283,7 @@ def _ensure_variant_file(
             tmp_path.replace(disk_path)
         except Exception:
             if not disk_path.exists():
-                _art_cache_inc("broken")
-                _dprint(f"[ART][BROKEN] replace-failed key={str(cache_key)[:96]}")
                 return None
-        _art_cache_inc("writes")
-        _dprint(f"[ART][CACHE_WRITE] disk key={str(cache_key)[:96]}")
     finally:
         try:
             if tmp_path.exists():
@@ -336,28 +308,19 @@ def _pixmap_from_variant(
 
     cached = _cache_get(_DERIVED_PIXMAP_CACHE, cache_key)
     if not cached.isNull():
-        _dprint("[PERF][POSTER_CACHE] hit=1 tier=memory")
         return cached
 
     pixmap = _load_variant_pixmap(cache_key)
-    if not pixmap.isNull():
-        _dprint("[PERF][POSTER_CACHE] hit=1 tier=disk")
     if pixmap.isNull():
         disk_path = _ensure_variant_file(cache_key, image_path, mode, w, h, radius)
         if disk_path is not None:
             pixmap = QPixmap(str(disk_path))
-            if not pixmap.isNull():
-                _dprint("[PERF][POSTER_CACHE] hit=0 tier=build-disk-write")
 
     if pixmap.isNull():
         variant = _build_variant_image(image_path, mode, w, h, radius)
         if variant.isNull():
-            _art_cache_inc("broken")
-            _dprint(f"[ART][BROKEN] build-failed key={str(cache_key)[:96]}")
             return QPixmap()
         pixmap = QPixmap.fromImage(variant)
-        if not pixmap.isNull():
-            _dprint("[PERF][POSTER_CACHE] hit=0 tier=build-memory-only")
     if pixmap.isNull():
         return QPixmap()
     return _cache_put(_DERIVED_PIXMAP_CACHE, cache_key, pixmap, _DERIVED_PIXMAP_CACHE_LIMIT)
@@ -494,51 +457,8 @@ def load_pixmap_cached(image_path: Optional[Path]) -> QPixmap:
     except Exception:
         pixmap = QPixmap()
     if pixmap.isNull():
-        _art_cache_inc("broken")
-        _dprint(f"[ART][BROKEN] source-load-failed path={str(image_path or '')[:160]}")
         return QPixmap()
     return _cache_put(_SOURCE_PIXMAP_CACHE, key, pixmap, _SOURCE_PIXMAP_CACHE_LIMIT)
-
-
-def poster_cache_stats() -> dict[str, int]:
-    return {
-        "hits": int(_ART_CACHE_STATS.get("hits", 0)),
-        "misses": int(_ART_CACHE_STATS.get("misses", 0)),
-        "writes": int(_ART_CACHE_STATS.get("writes", 0)),
-        "broken": int(_ART_CACHE_STATS.get("broken", 0)),
-        "memory_source_items": int(len(_SOURCE_PIXMAP_CACHE)),
-        "memory_variant_items": int(len(_DERIVED_PIXMAP_CACHE)),
-    }
-
-
-def clear_poster_cache(*, clear_disk: bool = True) -> int:
-    removed = 0
-    _SOURCE_PIXMAP_CACHE.clear()
-    _DERIVED_PIXMAP_CACHE.clear()
-    _PATH_CACHE_KEYS.clear()
-    for key in ("hits", "misses", "writes", "broken"):
-        _ART_CACHE_STATS[key] = 0
-    try:
-        QPixmapCache.clear()
-    except Exception:
-        pass
-    if clear_disk and _ARTWORK_VARIANT_CACHE_DIR is not None:
-        try:
-            for file_path in _ARTWORK_VARIANT_CACHE_DIR.glob("*.png"):
-                try:
-                    file_path.unlink()
-                    removed += 1
-                except Exception:
-                    continue
-        except Exception:
-            pass
-    clear_pending_artwork_prewarm()
-    if clear_disk and _ARTWORK_VARIANT_CACHE_DIR is not None:
-        try:
-            _ARTWORK_VARIANT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-    return int(removed)
 
 
 def center_crop_pixmap(src: QPixmap, w: int, h: int) -> QPixmap:

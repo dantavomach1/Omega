@@ -61,18 +61,6 @@ class EpisodeThumbnailer:
         with self._state_lock:
             return bool(self._outstanding > 0)
 
-    def outstanding_count(self) -> int:
-        with self._state_lock:
-            return int(self._outstanding)
-
-    def pending_count(self) -> int:
-        with self._state_lock:
-            return int(len(self._pending_tasks))
-
-    def active_worker_count(self) -> int:
-        with self._state_lock:
-            return 1 if str(self._active_episode_key or "").strip() else 0
-
     def is_paused(self) -> bool:
         with self._state_lock:
             return bool(self._paused)

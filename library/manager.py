@@ -318,17 +318,6 @@ class LibraryManager:
         self._data = self.repository.data
         return report, changed
 
-    def index_health(self) -> Dict[str, Any]:
-        return dict(self.repository.index_health())
-
-    def rebuild_search_index(self) -> bool:
-        changed = self.repository.rebuild_search_index()
-        self._data = self.repository.data
-        return bool(changed)
-
-    def search_titles(self, query: str, *, limit: int = 30) -> List[Dict[str, Any]]:
-        return list(self.repository.search_titles(query, limit=limit))
-
     def ensure_default_source(self) -> bool:
         """
         If there are NO sources at all, automatically add the local Media/Shows folder.
