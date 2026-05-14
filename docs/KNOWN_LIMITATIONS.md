@@ -16,6 +16,7 @@
 ## 3. Recently Resolved / Controlled
 - `AGENTS.md` now defines Codex interaction rules.
 - Accidental governance scope drift was cleaned up so only `AGENTS.md` remained from that pass.
+- Home tuning contract mismatch that caused `HomeLayoutTuning` startup attribute crashes is now controlled by code alignment and a regression test.
 
 ## 4. Update Rules
 - Add a limitation when a pass discovers something incomplete or unverified.

@@ -420,6 +420,32 @@ class HomeLayoutTuning:
     rail_pad_min_px: int = 20
     rail_pad_max_px: int = 40
 
+    # Home runtime/readiness and rail behavior tuning.
+    rail_pad_ratio_of_card_h: float = 0.15
+    hero_space_ratio_of_viewport_h: float = 0.30
+    hero_space_min_px: int = 260
+    hero_space_max_px: int = 640
+    hero_space_min_viewport_ratio: float = 0.20
+    hero_rotation_interval_ms: int = 12750
+    rail_fade_px: int = 100
+    snap_page_steps: int = 5
+    resize_debounce_ms: int = 24
+    thumbs_pump_interval_ms: int = 400
+    home_initial_rows_render: int = 2
+    home_deferred_rows_chunk: int = 1
+    home_deferred_rows_interval_ms: int = 140
+    home_row_render_prefetch_margin_viewports: float = 1.0
+    home_row_render_prefetch_min_px: int = 240
+    home_scroll_schedule_debounce_ms: int = 60
+    row_item_cap: int = 10
+    first_paint_min_viewport_w_px: int = 720
+    first_paint_min_viewport_h_px: int = 420
+    startup_cover_fade_ms: int = 170
+    startup_status_text: str = "Preparing Home"
+    chevron_size_px: int = 52
+    chevron_font_px: int = 22
+    chevron_step_px: int = 400
+
 
 @dataclass(frozen=True)
 class LibraryIngestionTuning:

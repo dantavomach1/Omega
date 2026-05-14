@@ -1,5 +1,23 @@
 [
   {
+    "id": "2026-05-14-omega-home-tuning-attribute-crash-fix",
+    "date": "2026-05-14",
+    "title": "Fix Home tuning startup attribute crash",
+    "area": "startup",
+    "summary": "Fixed startup crash caused by missing Home tuning fields (including thumbs_pump_interval_ms on HomeLayoutTuning) and added a regression test that checks self.T.home references against HomeLayoutTuning fields.",
+    "files_changed": [
+      "player/controller.py",
+      "tests/test_tuning_contract.py",
+      "docs/KNOWN_LIMITATIONS.md",
+      "data/changelog.json"
+    ],
+    "tests_run": [
+      "C:\\Program Files\\LibreOffice\\program\\python.exe -m compileall .",
+      "C:\\Program Files\\LibreOffice\\program\\python.exe -m unittest tests/test_tuning_contract.py"
+    ],
+    "notes": "Narrow startup crash fix only. No broad Home redesign, repository/scanner changes, or MPV backend changes were made. venv Python launch was blocked in this environment."
+  },
+  {
     "id": "2026-05-14-omega-project-control-files-pass",
     "date": "2026-05-14",
     "title": "Add Omega project control files",
