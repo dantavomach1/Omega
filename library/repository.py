@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from omega.app.contracts import ShowGroup
 from omega.app.text_naming import NameCleaner
+from omega.library.search_index import LibrarySearchIndex
 
 
 def _now_ts() -> int:
@@ -218,6 +219,8 @@ class LibraryRepository:
     def __init__(self, library_json_path: Path, *, backup_dir: Optional[Path] = None) -> None:
         self.library_json_path = Path(library_json_path)
         self.backup_dir = Path(backup_dir) if backup_dir is not None else None
+        self.index_db_path = self.library_json_path.parent / ".omega_cache" / "library_index.sqlite3"
+        self._search_index = LibrarySearchIndex(self.index_db_path)
         self._data: Dict[str, Any] = self._empty_payload()
         self._loaded_from_backup = False
         self._load_notes: List[str] = []
@@ -555,6 +558,7 @@ class LibraryRepository:
                 self._data = self._empty_payload()
                 self._load_notes.append("primary library file could not be read")
             self._data = self._normalize_payload(self._data)
+            self._sync_search_index(reason="load-recover")
             if recovered:
                 try:
                     self.save()
@@ -567,6 +571,7 @@ class LibraryRepository:
             return self._data
 
         self._data = self._normalize_payload(raw)
+        self._sync_search_index(reason="load")
         _debug_log(
             f"[LIBRARY][LOAD] path={self.library_json_path} recovered=False "
             f"titles={len(self._data.get('titles', []) or [])}"
@@ -606,6 +611,43 @@ class LibraryRepository:
         self._data = self._normalize_payload(self._data)
         _json_dump_atomic(self.library_json_path, self._data, backup_dir=self.backup_dir)
 
+    def _sync_search_index(self, *, reason: str) -> None:
+        try:
+            self._search_index.rebuild(self.load_title_records(), self.source_records())
+            _debug_log(
+                f"[LIBRARY][INDEX] reason={reason} path={self.index_db_path} "
+                f"titles={len(self.load_title_records())} sources={len(self.source_records())}"
+            )
+        except Exception as exc:
+            self._append_error(f"[INDEX][ERROR] {type(exc).__name__}: {exc}")
+            _debug_log(f"[LIBRARY][INDEX][WARN] reason={reason} error={type(exc).__name__}: {exc}")
+
+    def index_health(self) -> Dict[str, Any]:
+        try:
+            return self._search_index.health()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "index_path": str(self.index_db_path),
+                "schema_version": 0,
+                "fts_enabled": False,
+                "title_count": 0,
+                "source_count": 0,
+                "last_rebuild_at": 0,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    def rebuild_search_index(self) -> bool:
+        self._sync_search_index(reason="manual-rebuild")
+        after = self.index_health()
+        return bool(after.get("ok"))
+
+    def search_titles(self, query: str, *, limit: int = 30) -> List[Dict[str, Any]]:
+        try:
+            return self._search_index.search(query, limit=limit)
+        except Exception:
+            return []
+
     def source_records(self) -> List[Dict[str, Any]]:
         sources = self._data.get("sources", [])
         if not isinstance(sources, list):
@@ -620,6 +662,7 @@ class LibraryRepository:
         self._data["sources"] = self._normalize_sources(list(records))
         self._data["updated_at"] = _now_ts()
         self.save()
+        self._sync_search_index(reason="set-sources")
 
     def upsert_source_records(self, records: Sequence[Dict[str, Any]], *, enabled: Optional[bool] = None) -> Tuple[List[Path], List[Path], List[str]]:
         current = self.source_records()
@@ -977,6 +1020,7 @@ class LibraryRepository:
             "error": "",
         }
         self.save()
+        self._sync_search_index(reason="commit")
         return LibraryBatchSummary(
             batch_id=_safe_str(batch_id),
             source_label=_safe_str(source_label),
@@ -1206,4 +1250,5 @@ class LibraryRepository:
         changed = before != after
         if changed:
             self.save()
+        self._sync_search_index(reason="repair")
         return self.health_check(), changed
