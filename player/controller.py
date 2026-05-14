@@ -426,6 +426,7 @@ class HomeLayoutTuning:
     hero_space_min_px: int = 260
     hero_space_max_px: int = 640
     hero_space_min_viewport_ratio: float = 0.20
+    hero_space_max_viewport_ratio: float = 0.42
     hero_rotation_interval_ms: int = 12750
     rail_fade_px: int = 100
     snap_page_steps: int = 5

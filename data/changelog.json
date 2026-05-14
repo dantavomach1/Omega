@@ -1,5 +1,27 @@
 [
   {
+    "id": "2026-05-14-omega-home-tuning-contract-startup-fix",
+    "date": "2026-05-14",
+    "title": "Fix Home tuning contract startup crash",
+    "area": "startup",
+    "summary": "Fixed startup crash caused by Home customization passing an unknown Home tuning field, audited Home tuning references and override keys, and updated regression coverage for the Home tuning contract.",
+    "files_changed": [
+      "player/controller.py",
+      "tests/test_tuning_contract.py",
+      "data/changelog.json"
+    ],
+    "tests_run": [
+      "py -3 -m compileall . (failed: No installed Python found)",
+      "C:\\Users\\notmy\\Documents\\Documents\\media-tv-brain\\.venv\\Scripts\\python.exe -m compileall . (failed: Python313 executable access denied)",
+      "py -3 -m unittest tests/test_tuning_contract.py (failed: No installed Python found)",
+      "C:\\Users\\notmy\\Documents\\Documents\\media-tv-brain\\.venv\\Scripts\\python.exe -m unittest tests/test_tuning_contract.py (failed: Python313 executable access denied)",
+      "C:\\Program Files\\LibreOffice\\program\\python.exe -m compileall .",
+      "C:\\Program Files\\LibreOffice\\program\\python.exe -m unittest tests/test_tuning_contract.py",
+      "C:\\Users\\notmy\\Documents\\Documents\\media-tv-brain\\.venv\\Scripts\\python.exe C:\\Users\\notmy\\Documents\\Documents\\media-tv-brain\\run_omega.py (failed: Python313 executable access denied)"
+    ],
+    "notes": "Narrow startup contract fix only. No Home redesign, scanner/repository changes, or MPV behavior changes were made."
+  },
+  {
     "id": "2026-05-14-omega-home-tuning-attribute-crash-fix",
     "date": "2026-05-14",
     "title": "Fix Home tuning startup attribute crash",

@@ -28,6 +28,26 @@ def _home_tuning_refs(source: str) -> set[str]:
     return set(refs)
 
 
+def _app_customization_default_block(source: str) -> str:
+    start = source.find("def _app_customization_default(")
+    assert start >= 0, "_app_customization_default function not found"
+    end = source.find("def _app_customization_merge_from_state(", start + 1)
+    if end < 0:
+        return source[start:]
+    return source[start:end]
+
+
+def _home_customization_override_keys(source: str) -> set[str]:
+    block = _app_customization_default_block(source)
+    match = re.search(
+        r'"home"\s*:\s*\{(?P<body>.*?)\}\s*,\s*"overlays"\s*:\s*\{',
+        block,
+        flags=re.DOTALL,
+    )
+    assert match is not None, "Unable to parse home customization keys in _app_customization_default"
+    return set(re.findall(r'"([A-Za-z_][A-Za-z0-9_]*)"\s*:', match.group("body")))
+
+
 class HomeTuningContractTests(unittest.TestCase):
     def test_home_tuning_contract_matches_controller_references(self) -> None:
         source = CONTROLLER_PATH.read_text(encoding="utf-8", errors="ignore")
@@ -41,10 +61,30 @@ class HomeTuningContractTests(unittest.TestCase):
             + ", ".join(missing),
         )
 
-    def test_home_tuning_includes_thumb_pump_interval(self) -> None:
+    def test_home_customization_overrides_match_home_tuning_fields(self) -> None:
         source = CONTROLLER_PATH.read_text(encoding="utf-8", errors="ignore")
         fields = _home_tuning_fields(source)
-        self.assertIn("thumbs_pump_interval_ms", fields)
+        override_keys = _home_customization_override_keys(source)
+
+        missing = sorted(name for name in override_keys if name not in fields)
+        self.assertFalse(
+            missing,
+            "HomeLayoutTuning is missing fields used by home customization overrides: "
+            + ", ".join(missing),
+        )
+
+    def test_home_tuning_includes_required_startup_fields(self) -> None:
+        source = CONTROLLER_PATH.read_text(encoding="utf-8", errors="ignore")
+        fields = _home_tuning_fields(source)
+        required_fields = {
+            "thumbs_pump_interval_ms",
+            "hero_space_max_viewport_ratio",
+        }
+        missing = sorted(name for name in required_fields if name not in fields)
+        self.assertFalse(
+            missing,
+            "HomeLayoutTuning is missing required startup tuning fields: " + ", ".join(missing),
+        )
 
 
 if __name__ == "__main__":
