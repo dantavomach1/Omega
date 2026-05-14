@@ -1,0 +1,17 @@
+[
+  {
+    "id": "2026-05-14-omega-project-control-files-pass",
+    "date": "2026-05-14",
+    "title": "Add Omega project control files",
+    "area": "governance",
+    "summary": "Added lightweight project-control files for architecture context, work queue tracking, known limitations, and changelog discipline.",
+    "files_changed": [
+      "docs/ARCHITECTURE.md",
+      "docs/WORK_QUEUE.md",
+      "docs/KNOWN_LIMITATIONS.md",
+      "data/changelog.json"
+    ],
+    "tests_run": [],
+    "notes": "Governance/documentation pass only. No application behavior was intentionally changed."
+  }
+]
